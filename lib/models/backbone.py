@@ -14,11 +14,11 @@ from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
 from typing import Dict, List
 
-import models
-from models.cls_cvt import build_CvT
-from models.swin_transformer import build_swin_transformer
+import lib.models as models
+from lib.models.cls_cvt import build_CvT
+from lib.models.swin_transformer import build_swin_transformer
 
-from utils.misc import clean_state_dict
+from lib.utils.misc import clean_state_dict
 
 from .position_encoding import build_position_encoding
 

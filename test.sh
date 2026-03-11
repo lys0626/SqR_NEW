@@ -4,16 +4,17 @@
 # ==============================================================================
 
 # ================= 1. 配置必须与训练时一致 =================
-GPU_ID=0
-DATASET_NAME="mimic"
-DATASET_NAME_UPPER="MIMIC"
-DATA_DIR="/data/mimic_cxr/PA/7_1_2"
+GPU_ID=1
+DATASET_NAME="nih"
+DATASET_NAME_UPPER="NIH-CHEST"
+DATA_DIR="/data/nih-chest-xrays"
 EXP_DIR="./experiment/robust_run"
+
+STAGE2_METHOD="splicemix-cl"
 # DATANAME="nih"
 # DATASET_NAME_UPPER="NIH-CHEST"
 # DATA_DIR="/data/nih-chest-xrays"
-# 配置为 "splicemix" 或 "splicemix-cl"
-STAGE2_METHOD="splicemix-cl"  
+# 配置为 "splicemix" 或 "splicemix-cl"  
 
 # ================= 2. 动态拼接权重路径 =================
 STAGE2_OUT="${EXP_DIR}/${DATASET_NAME}_stage2_${STAGE2_METHOD}"
@@ -44,7 +45,9 @@ fi
 # 根据 utils.py 的保存逻辑，实际目录为: <STAGE2_OUT>/<DATASET>/<MODEL_ARG>/
 # 注意: engine.py 中保存的文件名写死为了 ${data_set}_splicemix_best.pt 
 # (不管加没加 CL，文件名都是这个，依靠外层的模型文件夹区分)
-WEIGHTS_PATH="${STAGE2_OUT}/${DATASET_NAME_UPPER}/${MODEL_DIR}/${DATASET_NAME_UPPER}_${METHOD_SUFFIX}_best.pt"echo "==================================================="
+# WEIGHTS_PATH="${STAGE2_OUT}/${DATASET_NAME_UPPER}/${MODEL_DIR}/${DATASET_NAME_UPPER}_${METHOD_SUFFIX}_best.pt"
+WEIGHTS_PATH="/data/dsj/lys/SqR-NEW/experiment/robust_run/nih_stage2_splicemix-cl/NIH-CHEST/SpliceMix_CL/NIH-CHEST_splicemix_best.pt"
+echo "==================================================="
 echo "  启动测试评估模式 (Evaluate Only) "
 echo "  ==> 评估方法: ${STAGE2_METHOD}"
 echo "  ==> 加载权重: ${WEIGHTS_PATH}"

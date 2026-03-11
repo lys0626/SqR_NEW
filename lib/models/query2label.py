@@ -14,7 +14,7 @@ import math
 
 from lib.models.backbone import build_backbone
 from lib.models.transformer import build_transformer
-from utils.misc import clean_state_dict
+from lib.utils.misc import clean_state_dict
 #构建分类头
 class GroupWiseLinear(nn.Module):
     # could be changed to: 

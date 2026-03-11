@@ -1,0 +1,6 @@
+[26|03-11 19:55:46]: Namespace(Sprob=1.0, acc_top_k=3, backend='nccl', batch_size=32, batch_size_per=32, clean_mask_path='', cuda_devices=[1], data_root='/data/nih-chest-xrays', data_set='NIH-CHEST', disable_amp=False, distributed=False, epoch_step=[40, 60], epochs=100, evaluate=0, grids=['2x2'], image_size=224, is_train=False, load_optimizer=False, local_rank=0, lr=0.05, lr_decay=0.1, lrp=0.1, master_addr='127.0.0.1', master_port='45887', mixer='SpliceMix--Default=True', model='SpliceMix_CL', momentum=0.9, n_grids=[0], num_workers=16, optimizer='SGD', print_verbose=1, rank=0, remark='', resume='/data/dsj/lys/SqR-NEW/experiment/robust_run/nih_stage2_splicemix-cl/NIH-CHEST/SpliceMix_CL/NIH-CHEST_splicemix_best.pt', save_dir='checkpoint_2x2', save_path='checkpoint_2x2/NIH-CHEST/SpliceMix_CL', seed=95, start_epoch=0, start_time='2026-03-11-19-55', warmup_epochs=5, weight_decay=0.0001, world_size=1)
+[26|03-11 19:55:52]: ==> Loaded checkpoint from /data/dsj/lys/SqR-NEW/experiment/robust_run/nih_stage2_splicemix-cl/NIH-CHEST/SpliceMix_CL/NIH-CHEST_splicemix_best.pt
+[26|03-11 19:55:52]:     Missing keys: []
+[26|03-11 19:55:52]:     Unexpected keys: []
+[26|03-11 19:56:11]: [Test] time: 00:18s, loss: 0.1469, mAUC: 0.8322, miF1: 0.2085, maF1: 0.1392, miP: 0.5283, maP: 0.4253 .
+[26|03-11 19:56:11]: --[Test-best] (E0), mAUC: 0.8322

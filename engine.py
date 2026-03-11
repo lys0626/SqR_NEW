@@ -55,7 +55,7 @@ class Engine(object):
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[self.rank])
         
         if 'SpliceMix' in self.args.mixer:
-            self.mixer = SpliceMix.SpliceMix(mode=self.args.mixer, grids=self.args.grids,
+            self.mixer = SpliceMix(mode=self.args.mixer, grids=self.args.grids,
                                              n_grids=self.args.n_grids, mix_prob=self.args.Sprob).mixer
 
     def train(self):

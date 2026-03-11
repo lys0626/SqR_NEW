@@ -67,7 +67,7 @@ def init(args):
         os.makedirs(opj(args.save_path, 'log'), exist_ok=True)
         # 复制模型定义文件以供参考
         file_name = model_name + f'_lr{args.lr:.1e}_' + args.start_time + '.py'
-        shutil.copyfile(opj('models', args.model + '.py'),
+        shutil.copyfile(opj('models_s2', args.model + '.py'),
                         opj(args.save_path, 'log', file_name))
 
     return args
@@ -124,16 +124,20 @@ def get_dataset(args):
                                               transform=train_transfm)
     elif args.data_set in ('NIH-CHEST'):
         data_dir = args.data_root
-        # NIH-CHEST 使用 'valid' 模式 (val_list.txt) 进行训练时验证
-        test_set = data_dict[args.data_set](data_dir, mode='valid', transform=test_transfm)
+        # [修改点] 动态判断：如果是训练模式就用 valid，如果是纯评估模式就用 test
+        eval_mode = 'valid' if args.is_train else 'test'
+        if not args.is_train:
+            print(f"!!! [Evaluation Mode] Loading TEST dataset for NIH-CHEST !!!")
+        test_set = data_dict[args.data_set](data_dir, mode=eval_mode, transform=test_transfm)
         train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
     
     # --- MODIFIED: 合并了 MIMIC 和 CHEXPERT 的逻辑
     elif args.data_set in ('MIMIC'):
         data_dir = args.data_root # 假设根目录设置正确
-        # MIMIC (JSON-based [cite: image_e1cd19.png]) 和 CHEXPERT (假设) 没有验证集
-        # 因此在训练时使用 'test' 模式进行验证
-        test_set = data_dict[args.data_set](data_dir, mode='valid', transform=test_transfm)
+        eval_mode = 'valid' if args.is_train else 'test'
+        if not args.is_train:
+            print(f"!!! [Evaluation Mode] Loading TEST dataset for NIH-CHEST !!!")
+        test_set = data_dict[args.data_set](data_dir, mode=eval_mode, transform=test_transfm)
         train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
     else:
         raise ValueError(f"未知的数据集: {args.data_set}")
