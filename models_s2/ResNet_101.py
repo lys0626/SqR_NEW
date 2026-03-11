@@ -1,7 +1,7 @@
 import torch
 import torchvision
 import torch.nn as nn
-import models.loss_fns as loss_fns
+import models_s2.loss_fns as loss_fns
 
 class model(nn.Module):
     def __init__(self, num_classes, pretrained=True, args=None):

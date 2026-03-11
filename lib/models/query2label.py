@@ -12,8 +12,8 @@ import torch.distributed as dist
 import numpy as np
 import math
 
-from models.backbone import build_backbone
-from models.transformer import build_transformer
+from lib.models.backbone import build_backbone
+from lib.models.transformer import build_transformer
 from utils.misc import clean_state_dict
 #构建分类头
 class GroupWiseLinear(nn.Module):

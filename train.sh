@@ -1,25 +1,23 @@
 #!/bin/bash
-# ==============================================================================
-#  Unified Robust MLC - 单卡端到端训练脚本 (动态命名版)
-# ==============================================================================
-
+# [新增] 强行让系统优先使用 lys2 虚拟环境里的 C++ 库！
+export LD_LIBRARY_PATH="/home/dsj/anaconda3/envs/lys2/lib:$LD_LIBRARY_PATH"
 # ================= 1. 基础全局配置 =================
 GPU_ID=0                                 # 指定使用的单卡 GPU 编号
-DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
-DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
-DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
+# DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
+# DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
+# DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
 EXP_DIR="./experiment/robust_run"        # 实验输出的顶层根目录
-# DATANAME="nih"
-# DATASET_NAME_UPPER="NIH-CHEST"
-# DATA_DIR="/data/nih-chest-xrays"
+DATASET_NAME="nih"
+DATASET_NAME_UPPER="NIH-CHEST"
+DATA_DIR="/data/nih-chest-xrays"
 # ================= 2. 方法选择配置 =================
 # 可选值: "splicemix" 或 "splicemix-cl"
 STAGE2_METHOD="splicemix-cl"             
-
+NUM_CLASS=14
 # ================= 3. 动态生成输出目录 =================
 # 生成的目录样式示例: ./experiment/robust_run/mimic_stage1_q2l
 # 生成的目录样式示例: ./experiment/robust_run/mimic_stage2_splicemix-cl
-STAGE1_OUT="${EXP_DIR}/${DATASET_NAME}_stage1_q2l"
+STAGE1_OUT="${EXP_DIR}/${DATASET_NAME}_stage1_${STAGE2_METHOD}_q2l"
 STAGE2_OUT="${EXP_DIR}/${DATASET_NAME}_stage2_${STAGE2_METHOD}"
 
 mkdir -p ${STAGE1_OUT}
@@ -34,12 +32,25 @@ python stage1_main.py \
   --dataset_dir ${DATA_DIR} \
   --output ${STAGE1_OUT} \
   --epochs 4 \
-  --splicemix_start_epoch 3 \
+  --splicemix_start_epoch 2 \
   --rolt_start_epoch 1 \
   --batch-size 32 \
   --optim AdamW \
   --lr 1e-4 \
-  -cd ${GPU_ID}
+  -cd ${GPU_ID} \
+  --img_size 224 \
+  --num_class ${NUM_CLASS} \
+  --backbone resnet50 \
+  --workers 4 \
+  --pretrained \
+  --momentum 0.9 \
+  --keep_input_proj \
+  --hidden_dim 512 \
+  --dim_feedforward 2048 \
+  --dec_layers 2 \
+  --enc_layers 1 \
+  --nheads 4 \
+  --scheduler StepLR
 
 
 echo "==================================================="
