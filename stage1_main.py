@@ -82,7 +82,11 @@ def parser_args():
     
     # 单卡设备指定
     parser.add_argument('-cd', '--cuda_devices', default=[0], nargs='+', type=int, help="Cuda device ids for running")
-    
+    # 【在这里插入以下 4 行缺失的参数】
+    parser.add_argument('--orid_norm', action='store_true', default=False, help='Use [0,1] normalization')
+    parser.add_argument('--cutout', action='store_true', default=False, help='Use cutout')
+    parser.add_argument('--n_holes', type=int, default=1, help='number of holes for cutout')
+    parser.add_argument('--length', type=int, default=16, help='length of holes for cutout')
     args = parser.parse_args()
     return args
 

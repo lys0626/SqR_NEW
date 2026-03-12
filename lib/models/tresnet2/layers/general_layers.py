@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .avg_pool import FastAvgPool2d
+from lib.models.tresnet.layers.avg_pool import FastAvgPool2d
 
 
 class Flatten(nn.Module):

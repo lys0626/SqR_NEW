@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 from torch.nn import Module as Module
 from collections import OrderedDict
-from .layers.anti_aliasing import AntiAliasDownsampleLayer
-from .layers.avg_pool import FastAvgPool2d
-from .layers.general_layers import SEModule, SpaceToDepthModule
+from lib.models.tresnet.layers.anti_aliasing import AntiAliasDownsampleLayer
+from lib.models.tresnet.layers.avg_pool import FastAvgPool2d
+from lib.models.tresnet.layers.general_layers import SEModule, SpaceToDepthModule
 
 try:
     from inplace_abn import InPlaceABNSync
