@@ -4,20 +4,22 @@
 # ==============================================================================
 
 # ================= 1. 配置必须与训练时一致 =================
-GPU_ID=1
+GPU_ID=6
 DATASET_NAME="nih"
 DATASET_NAME_UPPER="NIH-CHEST"
 DATA_DIR="/data/nih-chest-xrays"
-EXP_DIR="./experiment/robust_run"
 
-STAGE2_METHOD="splicemix-cl"
+# DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
+# DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
+# DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
+
+STAGE2_METHOD="splicemix"             # 配置为 "splicemix" 或 "splicemix-cl" 或 baseline
 # DATANAME="nih"
 # DATASET_NAME_UPPER="NIH-CHEST"
 # DATA_DIR="/data/nih-chest-xrays"
 # 配置为 "splicemix" 或 "splicemix-cl"  
 
 # ================= 2. 动态拼接权重路径 =================
-STAGE2_OUT="${EXP_DIR}/${DATASET_NAME}_stage2_${STAGE2_METHOD}"
 
 # 推导模型名称参数与目录名称
 if [ "$STAGE2_METHOD" = "splicemix-cl" ]; then
@@ -42,11 +44,7 @@ else
     METHOD_SUFFIX="baseline"        # <--- 新增 (对应 engine.py) 
 fi
 
-# 根据 utils.py 的保存逻辑，实际目录为: <STAGE2_OUT>/<DATASET>/<MODEL_ARG>/
-# 注意: engine.py 中保存的文件名写死为了 ${data_set}_splicemix_best.pt 
-# (不管加没加 CL，文件名都是这个，依靠外层的模型文件夹区分)
-# WEIGHTS_PATH="${STAGE2_OUT}/${DATASET_NAME_UPPER}/${MODEL_DIR}/${DATASET_NAME_UPPER}_${METHOD_SUFFIX}_best.pt"
-WEIGHTS_PATH="/data/dsj/lys/SqR-NEW/experiment/robust_run/nih_stage2_splicemix-cl/NIH-CHEST/SpliceMix_CL/NIH-CHEST_splicemix_best.pt"
+WEIGHTS_PATH="/data/dsj/lys/SqR-NEW/experiment/robust_run/nih/stage2_splicemix/NIH-CHEST/ResNet_50/NIH-CHEST_splicemix_best.pt"
 echo "==================================================="
 echo "  启动测试评估模式 (Evaluate Only) "
 echo "  ==> 评估方法: ${STAGE2_METHOD}"
@@ -55,11 +53,11 @@ echo "==================================================="
 
 # -e 0 : 强制进入 Evaluate 模式，不进行训练
 python stage2_main.py \
-  --data-set ${DATASET_NAME_UPPER} \
-  --data-root ${DATA_DIR} \
-  --model ${MODEL_ARG} \
-  -mixer ${MIXER_ARG} \
+  --data-set "${DATASET_NAME_UPPER}" \
+  --data-root "${DATA_DIR}" \
+  --model "${MODEL_ARG}" \
+  -mixer "${MIXER_ARG}" \
   --batch-size 32 \
   -e 0 \
-  -r ${WEIGHTS_PATH} \
+  -r "${WEIGHTS_PATH}" \
   -cd ${GPU_ID}

@@ -168,7 +168,6 @@ class chexpert(Dataset):
         """
         return len(self.select_cols)
 
-    # (删除了 @property 装饰器的方法, 因为它们不再需要)
 
     def __len__(self):
         return self._num_images

@@ -144,7 +144,7 @@ def main_worker(args, logger):
     logger.info(f"Optimizer Grouping: {len(backbone_params)} backbone params (lr1), {len(other_params)} other params (lr*0.1)")
 
     param_dicts = [
-        {"params": backbone_params, "lr": base_lr},
+        {"params": backbone_params, "lr": base_lr*0.1},
         {"params": other_params, "lr": base_lr},
     ]
 
@@ -229,7 +229,10 @@ def main_worker(args, logger):
             save_path = os.path.join(args.output, 'clean_indices.pt')
             torch.save(clean_indices, save_path)
             logger.info(f" >>> Saved {len(clean_indices)} clean samples to {save_path}. Exiting Stage 1 gracefully! <<<")
-            return  # 直接结束程序
+            # 【修复代码】防止 PyTorch 多进程 DataLoader 在清理时引发非 0 退出码
+            import sys
+            sys.stdout.flush() # 强制刷新控制台输出缓冲区，防止日志被截断
+            sys.exit(0)        # 强行以 0 (成功) 状态码退出，顺利向外层的 bash set -e 交差
             
         model.train()
         for param in model.parameters():

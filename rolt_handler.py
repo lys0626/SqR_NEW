@@ -146,7 +146,7 @@ class RoLT_Handler:
             num_samples = pos_indices.sum().item()
             
             # 样本太少无法拟合 GMM，直接视为 Clean
-            if num_samples < 10000000: 
+            if num_samples < 100: 
                 label_clean_matrix[pos_indices, c] = True
                 continue
                 
@@ -164,7 +164,7 @@ class RoLT_Handler:
             
             # GMM 拟合 (2 components)
             try:
-                gmm = GaussianMixture(n_components=2, max_iter=10, tol=1e-2, reg_covar=5e-4)#初始化一个高斯混合模型
+                gmm = GaussianMixture(n_components=2, max_iter=10, tol=1e-2, reg_covar=5e-4,random_state=self.args.seed)#初始化一个高斯混合模型
                 gmm.fit(dists)
                 
                 # 均值较小的 Gaussian 分布对应 Clean (距离原型近)
@@ -176,7 +176,6 @@ class RoLT_Handler:
                 
                 # 设定阈值 (如 0.5) 判定是否 Clean，在二分类的高斯混合模型中，0.5 是最自然的决策边界。
                 is_clean_subset = (prob_clean > 0.5)
-                # is_clean_subset = (prob_clean > 0.3)
                 # 将结果填回大矩阵
                 # 需要复杂的索引映射
                 full_indices = torch.where(pos_indices)[0]
@@ -214,7 +213,7 @@ class RoLT_Handler:
         noisy_counts = ((~label_clean_matrix) & valid_pos_mask).sum(dim=1)
         
         # 执行判定
-        is_sample_clean = no_finding_mask |((clean_counts+2) > noisy_counts)
+        is_sample_clean = no_finding_mask |((clean_counts+1) > noisy_counts)
         # 保留条件：要么是健康片子(没有标签)，要么是带病片子且正确的标签 >= 错误的标签
         # is_sample_clean = no_finding_mask | (clean_counts >= noisy_counts)
         

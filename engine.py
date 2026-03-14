@@ -186,9 +186,26 @@ class Engine(object):
             str_metrics = (
                 f"mAUC: {metrics_res['mAUC']:.4f}, "
                 f"miF1: {metrics_res['micro_F1']:.4f}, maF1: {metrics_res['macro_F1']:.4f}, "
-                f"miP: {metrics_res['micro_P']:.4f}, maP: {metrics_res['macro_P']:.4f}"
+                f"miP: {metrics_res['micro_P']:.4f}, maP: {metrics_res['macro_P']:.4f}, "
+                f"miR: {metrics_res['micro_R']:.4f}, maR: {metrics_res['macro_R']:.4f}"
             )
-        
+            # --- 新增：提取并打印每个具体疾病类别的 AUROC ---
+            if 'auc_list' in metrics_res:
+                auc_list = metrics_res['auc_list']
+                # 从 dataset 中获取疾病名称列表，做好容错处理
+                if hasattr(self.dataset['test'], 'classes'):
+                    class_names = self.dataset['test'].classes
+                else:
+                    class_names = [f"Class_{i}" for i in range(len(auc_list))]
+                
+                # 将疾病名称与对应的 AUC 拼接成字符串
+                per_class_str = ", ".join([
+                    f"{name}: {auc:.4f}" if auc != -1.0 else f"{name}: N/A" 
+                    for name, auc in zip(class_names, auc_list)
+                ])
+                # 打印详细的 Per-Class AUC
+                self.logger.info(f"[Per-Class AUC] {per_class_str}")
+
         if is_train:
             str_log = f'[Epoch {self.epoch}, lr{self.lr_curr}] [Train] time:{utils.strftime(self.epoch_time)}s, loss: {loss:.4f} .'
             self.logger.info(str_log)
