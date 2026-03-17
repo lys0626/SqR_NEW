@@ -5,7 +5,7 @@ from sklearn.mixture import GaussianMixture
 from tqdm import tqdm
 import math
 
-class RoLT_Handler:
+class RoLT_Handler(object):
     def __init__(self, args, model, train_loader, num_classes, feature_dim):
         """
         RoLT 逻辑处理器
@@ -27,7 +27,7 @@ class RoLT_Handler:
         
         # 存储上一轮的 clean mask 以便 momentum 更新 (可选，此处暂未实现以保持简单)
         self.prob_history = torch.zeros(len(train_loader.dataset)).to(self.device)
-    def step(self, epoch):
+    def step_center(self, epoch):
         """
         每个 Epoch 开始时调用。
         执行：特征提取 -> Masking -> 原型计算 -> GMM 清洗 -> 样本筛选 -> 软标签生成
@@ -57,11 +57,43 @@ class RoLT_Handler:
         # 6. 生成软伪标签 (Soft Pseudo Labels)
         # 为“噪声样本”生成用于校正的软标签
         # 返回: {sample_index: soft_targets(Tensor)}
-        soft_label_dict = self.generate_soft_labels(all_feats, all_logits, all_targets, all_indices, clean_mask_dict)        
+        soft_label_dict = self.generate_soft_labels(all_feats, all_logits, all_targets, all_indices, clean_mask_dict, label_clean_matrix)       
         print(f"==> [RoLT] Epoch {epoch}: Logic Flow Finished.\n")
         
         return clean_mask_dict, soft_label_dict
-
+    def step(self, epoch):
+        print(f"\n==> [RoLT] Epoch {epoch}: Starting Logic Flow (Small-Loss Criterion)...")
+        
+        # 1. 冻结模型 & 提取特征与 Logits
+        all_feats, all_logits, all_targets, all_indices = self.extract_features_and_mask()
+        
+        # 2. 计算初始类原型 (用于后续计算软标签中的 p_ncm)
+        self.update_prototypes(all_feats, all_targets)
+        
+        # ================== 新增: 计算 Loss 矩阵 ==================
+        # 计算所有样本在每个标签上的独立 BCE Loss
+        # reduction='none' 保证输出形状与 all_logits 一致，即 [N, C]
+        all_losses = F.binary_cross_entropy_with_logits(
+            all_logits, 
+            all_targets.float(), 
+            reduction='none'
+        )
+        # ==========================================================
+        
+        # 3. GMM 清洗 (传入 all_losses 代替 all_feats)
+        label_clean_matrix = self.gmm_cleaning(all_losses, all_targets)
+        
+        # 4. 样本级筛选
+        clean_mask_dict = self.apply_sample_selection_rule(label_clean_matrix, all_targets, all_indices)
+        
+        # 5. 二次更新原型
+        self.refine_prototypes(all_feats, all_targets, all_indices, clean_mask_dict)
+        
+        # 6. 生成软伪标签
+        soft_label_dict = self.generate_soft_labels(all_feats, all_logits, all_targets, all_indices, clean_mask_dict, label_clean_matrix)        
+        
+        print(f"==> [RoLT] Epoch {epoch}: Logic Flow Finished.\n")
+        return clean_mask_dict, soft_label_dict
     def extract_features_and_mask(self):
         """
         遍历数据集，提取特征，并根据 Target 进行 Masking
@@ -133,7 +165,7 @@ class RoLT_Handler:
                 
         self.prototypes = new_prototypes
 
-    def gmm_cleaning(self, feats, targets):
+    def gmm_cleaning_center(self, feats, targets):
         """
         对每个类别单独进行 GMM 聚类，区分 Clean/Noisy 标签
         """
@@ -189,7 +221,54 @@ class RoLT_Handler:
                 label_clean_matrix[pos_indices, c] = True
                 
         return label_clean_matrix
-
+    def gmm_cleaning(self, losses, targets):
+            """
+            基于 Small-Loss Criterion 的 GMM 清洗
+            """
+            print("[RoLT] Running GMM Cleaning per class (using Small-Loss Criterion)...")
+            # 初始化全为 False (Noisy)
+            label_clean_matrix = torch.zeros_like(targets, dtype=torch.bool).to(self.device)
+            
+            for c in range(self.num_classes):
+                pos_indices = (targets[:, c] == 1)
+                num_samples = pos_indices.sum().item()
+                
+                # 样本太少无法拟合 GMM，直接视为 Clean
+                if num_samples < 100: 
+                    label_clean_matrix[pos_indices, c] = True
+                    continue
+                    
+                # 获取该类别正样本的 Loss 值，作为 GMM 的一维输入
+                class_losses = losses[pos_indices, c]
+                
+                # 将 Loss 转换为 GMM 要求的 numpy 格式
+                dists = class_losses.detach().cpu().numpy().reshape(-1, 1)
+                
+                # GMM 拟合 (2 components)
+                try:
+                    gmm = GaussianMixture(n_components=2, max_iter=10, tol=1e-2, reg_covar=5e-4, random_state=self.args.seed)
+                    gmm.fit(dists)
+                    
+                    # 均值较小的 Gaussian 分布对应 Clean (Loss 越小越干净)
+                    clean_comp_idx = gmm.means_.argmin()
+                    
+                    # 获取每个样本属于 Clean 分布的概率 post_prob
+                    probs = gmm.predict_proba(dists)
+                    prob_clean = probs[:, clean_comp_idx]
+                    
+                    # 设定阈值 0.5 判定是否 Clean
+                    is_clean_subset = (prob_clean > 0.5)
+                    
+                    # 填回大矩阵
+                    full_indices = torch.where(pos_indices)[0]
+                    clean_indices = full_indices[is_clean_subset]
+                    label_clean_matrix[clean_indices, c] = True
+                    
+                except Exception as e:
+                    # GMM 失败的保守策略
+                    print(f"Warning: GMM failed for class {c}, setting all to clean. Error: {e}")
+                    label_clean_matrix[pos_indices, c] = True
+            return label_clean_matrix
     def apply_sample_selection_rule(self, label_clean_matrix, targets, indices):
         """
         严格且安全的筛选规则
@@ -213,7 +292,7 @@ class RoLT_Handler:
         noisy_counts = ((~label_clean_matrix) & valid_pos_mask).sum(dim=1)
         
         # 执行判定
-        is_sample_clean = no_finding_mask |((clean_counts+1) > noisy_counts)
+        is_sample_clean = no_finding_mask |((clean_counts+2) > noisy_counts)
         # 保留条件：要么是健康片子(没有标签)，要么是带病片子且正确的标签 >= 错误的标签
         # is_sample_clean = no_finding_mask | (clean_counts >= noisy_counts)
         
@@ -221,7 +300,7 @@ class RoLT_Handler:
         # 2. [新增] 附加判断条件
         # 统计每个样本的总正标签数
         # total_pos_tags = clean_counts + noisy_counts
-        #     # 识别出：只有一个标签 且 该标签是噪声 的样本
+        #     # 识别出：只有一个标签 且 该标签是噪声的样本
         #     # (此时 clean_counts 为 0, noisy_counts 为 1)
         # is_single_noisy = (total_pos_tags == 1) & (noisy_counts == 1)
         #     # 将这些样本强制设为 False (Noisy)
@@ -271,59 +350,76 @@ class RoLT_Handler:
                 
         self.prototypes = new_prototypes
 
-    def generate_soft_labels(self, feats, logits, targets, indices, clean_mask_dict):
-        """
-        生成软伪标签 (Soft Pseudo Labels) - 自定义混合比例
-        Formula: 0.4 * ERM + 0.2 * NCM + 0.2 * Original + 0.2 * Uniform
-        """
-        print("[RoLT] Generating Soft Pseudo Labels (Custom Mix: 0.4*ERM + 0.2*NCM + 0.2*Orig + 0.2*Uni)...")
-        
-        soft_label_dict = {}
-        
-        # 1. 找出 Noisy Samples (即被判定为不 Clean 的样本)
-        is_sample_trustworthy = torch.tensor(
-            [clean_mask_dict[idx.item()] for idx in indices]
-        ).bool().to(self.device)
-        
-        noisy_indices_loc = torch.where(~is_sample_trustworthy)[0]
-        
-        if len(noisy_indices_loc) == 0:
+    def generate_soft_labels(self, feats, logits, targets, indices, clean_mask_dict, label_clean_matrix):
+            """
+            生成软伪标签 (Soft Pseudo Labels) - 自定义混合比例
+            结合细粒度 GMM 清洗矩阵与假阴性(漏标)恢复策略
+            """
+            print("[RoLT] Generating Soft Pseudo Labels (Custom Mix: 0.1*ERM + 0.8*NCM + 0.1*Uni with Fine-Grained Replacement)...")
+            
+            soft_label_dict = {}
+            
+            # 1. 找出 Noisy Samples (即整体被判定为包含噪声或需要检查的样本)
+            is_sample_trustworthy = torch.tensor(
+                [clean_mask_dict[idx.item()] for idx in indices]
+            ).bool().to(self.device)
+            
+            noisy_indices_loc = torch.where(~is_sample_trustworthy)[0]
+            
+            if len(noisy_indices_loc) == 0:
+                return soft_label_dict
+                
+            # 提取 Noisy 样本的相关数据
+            noisy_feats = feats[noisy_indices_loc]     # [M, C, D]
+            noisy_logits = logits[noisy_indices_loc]   # [M, C]
+            noisy_targets = targets[noisy_indices_loc] # [M, C] (原始标签)
+            
+            # --- 组件 1: ERM 预测 (0.1 权重) ---
+            p_erm = torch.sigmoid(noisy_logits)
+            
+            # --- 组件 2: NCM 预测 (0.8 权重) ---
+            norm_feats = F.normalize(noisy_feats, p=2, dim=2)
+            # sim[i, c] = dot(feat[i,c], proto[c])
+            sims = torch.einsum('ncd,cd->nc', norm_feats, self.prototypes)
+            
+            # 【核心修复】引入 margin，将决策边界右移，防止正交(不相关)特征获得过高的基线概率
+            margin = 0.5 
+            tau = 10.0 
+            p_ncm = torch.sigmoid((sims - margin) * tau)
+            
+            # --- 组件 3: 均匀分布 (0.1 权重) ---
+            # 医疗数据集正样本极少，使用 0.05 作为安全基线
+            p_uniform = 0.05
+            
+            # --- 纯计算出的软标签张量 ---
+            pure_soft_targets = (0.1 * p_erm) + (0.8 * p_ncm) + (0.1 * p_uniform)
+            
+            # ================= 细粒度标签替换逻辑 =================
+            
+            # 1. 获取这些 Noisy 样本在 GMM 中的细粒度 Clean/Noisy 矩阵
+            fine_grained_clean_mask = label_clean_matrix[noisy_indices_loc] 
+            
+            # 2. 条件1：原本是阳性（1），但被判定为噪声（假阳性）
+            is_noisy_positive = (noisy_targets == 1) & (~fine_grained_clean_mask)
+            
+            # 3. 条件2：原本是阴性（0），但软标签算出来大于 0.5（疑似假阴性漏标）
+            # 如果模型极其确信这里有病灶，我们将其纳入替换范围
+            is_suspected_false_negative = (noisy_targets == 0) & (pure_soft_targets > 0.5)
+            
+            # 4. 合并替换条件：只要满足上面任意一种，就属于需要“被纠正”的标签
+            should_replace = is_noisy_positive | is_suspected_false_negative
+            
+            # 5. 执行细粒度替换：
+            # 满足条件的用 pure_soft_targets 覆盖；不满足的保留原始 target (绝对的 0 和 1)
+            final_soft_targets = torch.where(should_replace, pure_soft_targets, noisy_targets.float())
+            
+            # =======================================================
+
+            # 存入字典返回
+            noisy_real_indices = indices[noisy_indices_loc]
+            
+            for idx, s_label in zip(noisy_real_indices, final_soft_targets):
+                # 存入 CPU 字典以节省显存
+                soft_label_dict[idx.item()] = s_label.detach().cpu()
+                
             return soft_label_dict
-            
-        # 提取 Noisy 样本的相关数据
-        noisy_feats = feats[noisy_indices_loc]     # [M, C, D]
-        noisy_logits = logits[noisy_indices_loc]   # [M, C]
-        noisy_targets = targets[noisy_indices_loc] # [M, C] (原始标签)
-        
-        # --- 组件 1: ERM 预测 (0.4) ---
-        p_erm = torch.sigmoid(noisy_logits)
-        
-        # --- 组件 2: NCM 预测 (0.2) ---
-        norm_feats = F.normalize(noisy_feats, p=2, dim=2)
-        # sim[i, c] = dot(feat[i,c], proto[c])
-        sims = torch.einsum('ncd,cd->nc', norm_feats, self.prototypes)
-        tau = 10.0 
-        p_ncm = torch.sigmoid(sims * tau)
-        
-        # --- 组件 3: 原始标签 (0.2) ---
-        p_orig = noisy_targets.float()
-        
-        # --- 组件 4: 均匀分布 (0.2) ---
-        # 对于多标签二分类(BCE)，均匀分布/最大不确定性意味着概率为 0.5
-        # 0.5 太高了！在 NIH 数据集中，正样本比例极低，0.05 是更合理的基线
-        p_uniform = 0.05
-        
-        # --- 执行加权混合 ---
-        # 比例: 0.4 : 0.2 : 0.2 : 0.2
-        # soft_targets = (0.4 * p_erm) + (0.2 * p_ncm) + (0.2 * p_orig) + (0.2 * p_uniform)
-        # [核心修改] 新的权重分配
-        # 0.7 信任原型特征，0.2 信任模型当前预测，0.1 进行微量平滑
-        soft_targets = (0.1 * p_erm) + (0.8 * p_ncm) + (0.1 * p_uniform)
-        # 存入字典
-        noisy_real_indices = indices[noisy_indices_loc]
-        
-        for idx, s_label in zip(noisy_real_indices, soft_targets):
-            # 存入 CPU 字典以节省显存
-            soft_label_dict[idx.item()] = s_label.detach().cpu()
-            
-        return soft_label_dict
