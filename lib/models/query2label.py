@@ -118,7 +118,7 @@ class Qeruy2Label(nn.Module):
         else:
             out_features = None
             out_logits = None
-        # 4. --- 路径 B: SpliceMix 分支 ---
+        # 4. --- 路径 B: SpliceMix 分支 ---     无用
         # 原代码: features_pooled = src.mean(dim=[2, 3])
         # 原代码: out_splicemix = self.fc_splicemix(features_pooled)
         
