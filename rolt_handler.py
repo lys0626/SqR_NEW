@@ -7,6 +7,116 @@ import math
 import matplotlib.pyplot as plt
 from scipy.stats import norm
 import os
+import os
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.manifold import TSNE
+
+import os
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.manifold import TSNE
+
+def plot_feature_tsne(feats, targets, class_idx, epoch, class_names=None, save_dir="./diagnostics"):
+    """
+    [诊断工具 1 - 改进版] 用 t-SNE 可视化特定类别的正负样本特征分布，直接标注真实类别名称
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 获取类别名称，如果未提供列表则退化为 Class X
+    if class_names is not None and len(class_names) > class_idx:
+        class_name = class_names[class_idx]
+    else:
+        class_name = f"Class {class_idx}"
+        
+    # 1. 获取正样本和负样本的全局索引
+    pos_indices = torch.where(targets[:, class_idx] == 1)[0]
+    neg_indices = torch.where(targets[:, class_idx] == 0)[0]
+    
+    num_pos = len(pos_indices)
+    if num_pos < 10: 
+        print(f"[Diagnostics] {class_name} has too few positive samples ({num_pos}). Skipping t-SNE.")
+        return
+        
+    # 2. 随机采样负样本 (1:3 比例)
+    perm = torch.randperm(len(neg_indices))
+    num_neg_to_sample = min(num_pos * 3, len(neg_indices))
+    sampled_neg_indices = neg_indices[perm[:num_neg_to_sample]]
+    
+    # 3. 提取特征并转为 numpy
+    pos_feats = feats[pos_indices, class_idx, :].cpu().numpy()
+    neg_feats = feats[sampled_neg_indices, class_idx, :].cpu().numpy()
+    
+    all_feats = np.vstack((pos_feats, neg_feats))
+    labels = np.concatenate((np.ones(num_pos), np.zeros(num_neg_to_sample)))
+    
+    # 4. 运行 t-SNE
+    print(f"[Diagnostics] Running t-SNE for '{class_name}' at Epoch {epoch}...")
+    tsne = TSNE(n_components=2, random_state=42, perplexity=30, n_iter=1000)
+    feats_2d = tsne.fit_transform(all_feats)
+    
+    # 5. 绘图
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(x=feats_2d[:, 0], y=feats_2d[:, 1], hue=labels, 
+                    palette={1.0: 'red', 0.0: 'royalblue'}, 
+                    alpha=0.6, s=30)
+    
+    # 标题直接使用疾病名称
+    plt.title(f't-SNE Feature Representation - {class_name} (Epoch {epoch})', fontsize=14, fontweight='bold')
+    
+    handles, _ = plt.gca().get_legend_handles_labels()
+    plt.legend(handles, ['Negative (0)', 'Positive (1)'], title='Ground Truth')
+    
+    # 处理文件名：将疾病名称中的空格或斜杠替换为下划线，避免保存报错
+    safe_class_name = class_name.replace(" ", "_").replace("/", "_")
+    save_path = os.path.join(save_dir, f'tsne_{safe_class_name}_ep{epoch}.png')
+    
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"[Diagnostics] t-SNE plot saved to {save_path}")
+def plot_query_similarity(model, epoch, save_dir="./diagnostics"):
+    """
+    [诊断工具 2] 计算并绘制 Q2L Query Embeddings 的余弦相似度矩阵
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 1. 兼容 DDP 和单卡，安全获取原始模型
+    real_model = model.module if hasattr(model, 'module') else model
+    
+    # 2. 定位 Query Embeddings (Q2L官方实现中通常命名为 query_embed)
+    try:
+        if hasattr(real_model, 'query_embed'):
+            query_weights = real_model.query_embed.weight.detach() # [num_classes, hidden_dim]
+        elif hasattr(real_model, 'transformer') and hasattr(real_model.transformer, 'query_embed'):
+            query_weights = real_model.transformer.query_embed.weight.detach()
+        else:
+            print("[Diagnostics] Could not locate 'query_embed' in model. Skipping similarity matrix.")
+            return
+    except Exception as e:
+        print(f"[Diagnostics] Error fetching query embedding: {e}")
+        return
+        
+    # 3. 计算两两之间的余弦相似度
+    query_norm = torch.nn.functional.normalize(query_weights, p=2, dim=1)
+    sim_matrix = torch.matmul(query_norm, query_norm.T).cpu().numpy()
+    
+    # 4. 绘制热力图 
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(sim_matrix, annot=True, fmt=".2f", cmap="Reds", vmin=0.0, vmax=1.0, 
+                square=True, linewidths=.5, cbar_kws={"shrink": .8})
+    
+    plt.title(f'Query Embedding Cosine Similarity Matrix (Epoch {epoch})\n(High off-diagonal values indicate Query Collapse)', pad=20)
+    plt.xlabel('Class Index')
+    plt.ylabel('Class Index')
+    
+    save_path = os.path.join(save_dir, f'query_sim_ep{epoch}.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"[Diagnostics] Query similarity matrix saved to {save_path}")
 def plot_knn_purity(purities, class_idx, epoch, threshold, save_dir):
     """
     可视化 KNN 局部邻居的纯度 (Purity) 分布
@@ -102,7 +212,23 @@ class RoLT_Handler(object):
         
         # 1. 提取完整特征 (注意：这里必须是你之前修改过的、没有 mask 归零的特征！)
         all_feats, all_logits, all_targets, all_indices = self.extract_features_and_mask()
-        
+        # ========================================================
+        # [特征体检] 插入特征诊断代码 (例如：每 5 个 Epoch 做一次体检)
+        # ========================================================
+        try:
+            diag_dir = os.path.join(self.args.output, "diagnostics")
+        except AttributeError:
+            diag_dir = "./diagnostics"
+            
+        if epoch % 5 == 0:  
+            # 诊断一：Query 是否坍缩？
+            plot_query_similarity(self.model, epoch, save_dir=diag_dir)
+            
+            # 诊断二：查看前 3 个疾病类别的特征分布 (你可以修改 class_idx 查看特定疾病)
+            
+            for c in range(self.num_classes):
+                plot_feature_tsne(all_feats, all_targets, class_idx=c, epoch=epoch,save_dir=diag_dir)
+        # ========================================================
         # 2. 计算初始类原型
         self.update_prototypes(all_feats, all_targets)
         
@@ -275,6 +401,7 @@ class RoLT_Handler(object):
         vis_dir = os.path.join(base_out_dir, "knn_visualizations")
 
         for c in range(self.num_classes):
+            #计算在标签中每个类别的正样本数量
             pos_indices = torch.where(targets[:, c] == 1)[0]
             num_samples = len(pos_indices)
             
@@ -296,7 +423,7 @@ class RoLT_Handler(object):
                 print(f"  -> Class {c:02d} | Samples: {num_samples:<5} | Strategy: [Normal]  Threshold = {current_thresh}")
             # ========================================================
                 
-            # 提取特征并归一化
+            # 提取所有样本的类别c的特征并归一化
             class_feats = feats[:, c, :] 
             class_feats = F.normalize(class_feats, p=2, dim=1)
             
@@ -310,6 +437,7 @@ class RoLT_Handler(object):
                 sims = torch.matmul(batch_pos_feats, class_feats.T)
                 
                 actual_k = min(k + 1, sims.size(1))
+                #获取sims中每行最大的k+1个值的索引（包括自己），因为第一个是自己，所以取后k个作为邻居
                 _, topk_indices = sims.topk(actual_k, dim=1)
                 
                 neighbor_indices = topk_indices[:, 1:]
@@ -469,7 +597,7 @@ class RoLT_Handler(object):
         noisy_counts = ((~label_clean_matrix) & valid_pos_mask).sum(dim=1)
         
         # 执行判定
-        is_sample_clean = no_finding_mask |((clean_counts) > noisy_counts)
+        is_sample_clean = no_finding_mask |((clean_counts+2) > noisy_counts)
         # 保留条件：要么是健康片子(没有标签)，要么是带病片子且正确的标签 >= 错误的标签
         # is_sample_clean = no_finding_mask | (clean_counts >= noisy_counts)
         
