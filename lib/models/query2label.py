@@ -15,6 +15,7 @@ import math
 from lib.models.backbone import build_backbone
 from lib.models.transformer import build_transformer
 from lib.utils.misc import clean_state_dict
+
 #构建分类头
 class GroupWiseLinear(nn.Module):
     # could be changed to: 
@@ -36,7 +37,7 @@ class GroupWiseLinear(nn.Module):
         #uniform是均匀分布初始化方法，防止梯度消失或梯度爆炸
         stdv = 1. / math.sqrt(self.W.size(2))
         for i in range(self.num_class):
-            self.W[0][i].data.uniform_(-stdv, stdv)#.data的含义是直接访问张量的底层数据，绕过了PyTorch的自动求导机制(在修改张量内容时不被Autograd发现)，现在一般使用with torch.no_grad()来实现类似的功能
+            self.W[0][i].data.uniform_(-stdv, stdv)#.data的含义是直接访问张量的底层数据，绕过了PyTorch的自动求导机制
         if self.bias:
             for i in range(self.num_class):
                 self.b[0][i].data.uniform_(-stdv, stdv)
@@ -77,7 +78,8 @@ class Qeruy2Label(nn.Module):
         self.fc = GroupWiseLinear(num_class, hidden_dim, bias=True)
 
 
-    def forward(self, input):
+    # 【修改点】：增加了 return_attn=False 参数
+    def forward(self, input, return_attn=False):
         # 1. Backbone 前向传播
         outputs = self.backbone(input)
         
@@ -102,43 +104,29 @@ class Qeruy2Label(nn.Module):
         src_proj = self.input_proj(src)
 
         # 3. --- 路径 A: Transformer 分支 ---
-        # hs: [Layers, Batch, Num_Class, Hidden_Dim] -> Transformer Decoder 的隐层输出
-        # memory: [Batch, Hidden_Dim, H, W] -> Transformer Encoder 的空间特征
-        # hs, memory = self.transformer(src_proj, query_embed, pos, mask)
-        # [关键修正 1] 获取最后一层的类别特征
-        # out_features = hs[-1]
-        # [关键修正 2] 通过分类头得到最终 Logits
-        # out_logits = self.fc(out_features)
-        # 3. --- 路径 A: Transformer 分支 ---
         # 如果 pos 为 None (例如 Stage 2 换上了标准 CNN Backbone)，则直接跳过 Transformer 分支计算以节省显存和算力
         if pos is not None:
-            hs, memory = self.transformer(src_proj, query_embed, pos, mask)
+            # 【修改点】：接收 transformer 传出来的 attn_weights
+            hs, memory, attn_weights = self.transformer(src_proj, query_embed, pos, mask)
             out_features = hs[-1]
             out_logits = self.fc(out_features)
         else:
             out_features = None
             out_logits = None
-        # 4. --- 路径 B: SpliceMix 分支 ---     无用
-        # 原代码: features_pooled = src.mean(dim=[2, 3])
-        # 原代码: out_splicemix = self.fc_splicemix(features_pooled)
-        
-        # [修改] 暂时不在这里做池化和FC，而是直接把 src (空间特征) 返回去
-        # 或者为了兼容 Stage 2 的非 CL 模式，我们可以保留 Gap 分支，但额外返回 src
-        
+            attn_weights = None # 【修改点】
+
+        # 4. --- 路径 B: SpliceMix 分支 --- 
         features_pooled = src.amax(dim=[2, 3])
         out_splicemix = self.fc_splicemix(features_pooled)
         
-        # 返回: Logits, Class_Features, Aux_Logits, Spatial_Features(新增)
-        # src 的 shape: [B, C, H, W] (例如 [32, 2048, 14, 14])
+        # 【修改点】：如果要求返回注意力图，则包含 attn_weights
+        if return_attn:
+            return out_logits, out_features, out_splicemix, src, attn_weights
+            
+        # 正常训练默认不返回，节省显存与带宽
         return out_logits, out_features, out_splicemix, src
+
     #收集除了骨干网络backbone以外的所有可训练参数,以便在优化器中对它们进行单独的配置(通常是设置更高的学习率)
-    ''' 
-        self.transformer: Transformer 模块（包括 Encoder 和 Decoder）的所有权重。
-        self.fc: 最后的分类头（全连接层）。
-        self.input_proj: 将骨干网络特征映射到 Transformer 维度的 1x1 卷积层。
-        self.query_embed: 可学习的标签嵌入向量（即 Query）。 如果采用clip的文本编码器或者别的大预言模型可以考虑冻结这一部分(self.query_embed)，
-            但是考虑到文本编码器输出的特征维度与transformer的隐藏层维度可能不匹配，一般会添加一个投影层，这个投影层是需要训练的
-    '''
     def finetune_paras(self):
         from itertools import chain
         return chain(self.transformer.parameters(), self.fc.parameters(), self.input_proj.parameters(), self.query_embed.parameters())
@@ -148,12 +136,6 @@ class Qeruy2Label(nn.Module):
         print("=> loading checkpoint '{}'".format(path))
         #map_location参数用于指定加载模型时的设备位置，确保在分布式训练环境中每个进程都能正确加载对应的模型权重
         checkpoint = torch.load(path, map_location=torch.device(dist.get_rank()))
-        # import ipdb; ipdb.set_trace()
-        #在Query2Label模型中，self.backbone是一个Joiner对象(Joiner对象指的是将Backone和PositionEmbedding结合在一起的模块)
-        #self.backbone[0]是骨干网络Backbone,self.backbone[0].body是Backbone的主体网络部分
-        #self.backbone[1]指的是位置编码模块
-        #clean_state_dict(checkpoint['state_dict'])，遍历字典中的每一个key，如果发现开头是module.，就去掉这个前缀,解决module前缀不匹配的问题
-        #strict=False表示在加载权重时，如果模型的某些层在预训练权重中没有对应的参数，或者预训练权重中有一些额外的参数不在模型中，这些不匹配的情况不会引发错误，解决分类头不匹配的问题
         self.backbone[0].body.load_state_dict(clean_state_dict(checkpoint['state_dict']), strict=False)
         print("=> loaded ch eckpoint '{}' (epoch {})"
                   .format(path, checkpoint['epoch']))
@@ -169,12 +151,8 @@ def build_q2l(args):
         num_class = args.num_class
     )
     #是否要对输入特征图进行投影
-    #如果不需要投影(即图像特征的维度与transformer Decoder的hidden layer维度一致时)，则将input_proj设置为Identity层，即不进行任何变换
     if not args.keep_input_proj:
         model.input_proj = nn.Identity()
         print("set model.input_proj to Indentify!")
     
-
     return model
-        
-        

@@ -20,7 +20,6 @@ from torch import nn, Tensor
 from torch.nn import MultiheadAttention
 
 
-
 class Transformer(nn.Module):
 
     def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
@@ -32,7 +31,7 @@ class Transformer(nn.Module):
         super().__init__()
 
         self.num_encoder_layers = num_encoder_layers
-        if num_decoder_layers > 0:
+        if num_encoder_layers > 0:
             encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                     dropout, activation, normalize_before)
             encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
@@ -54,9 +53,6 @@ class Transformer(nn.Module):
         if self.rm_self_attn_dec or self.rm_first_self_attn:
             self.rm_self_attn_dec_func()
 
-        # self.debug_mode = False
-        # self.set_debug_mode(self.debug_mode)
-
     def rm_self_attn_dec_func(self):
         total_modifie_layer_num = 0
         rm_list = []
@@ -73,8 +69,6 @@ class Transformer(nn.Module):
 
             total_modifie_layer_num += 1
             rm_list.append(idx)
-        # remove some self-attention layer
-        # print("rm {} layer: {}".format(total_modifie_layer_num, rm_list))
 
     def set_debug_mode(self, status):
         print("set debug mode to {}!!!".format(status))
@@ -102,7 +96,6 @@ class Transformer(nn.Module):
         query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
         if mask is not None:
             mask = mask.flatten(1)
-
         
         if self.num_encoder_layers > 0:
             memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
@@ -110,10 +103,13 @@ class Transformer(nn.Module):
             memory = src
 
         tgt = torch.zeros_like(query_embed)
-        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
+        
+        # 【修改点】：接收 decoder 返回的 attn_weights
+        hs, attn_weights = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed)
         
-        return hs.transpose(1, 2), memory[:h*w].permute(1, 2, 0).view(bs, c, h, w)
+        # 【修改点】：返回 attn_weights
+        return hs.transpose(1, 2), memory[:h*w].permute(1, 2, 0).view(bs, c, h, w), attn_weights
 
 
 class TransformerEncoder(nn.Module):
@@ -157,11 +153,12 @@ class TransformerDecoder(nn.Module):
                 pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None):
         output = tgt
-
         intermediate = []
+        attn_weights = None # 【修改点】：新增变量存放 attention 图
 
         for layer in self.layers:
-            output = layer(output, memory, tgt_mask=tgt_mask,
+            # 【修改点】：接收 layer 的第二个返回值 attn_weights
+            output, attn_weights = layer(output, memory, tgt_mask=tgt_mask,
                            memory_mask=memory_mask,
                            tgt_key_padding_mask=tgt_key_padding_mask,
                            memory_key_padding_mask=memory_key_padding_mask,
@@ -176,9 +173,11 @@ class TransformerDecoder(nn.Module):
                 intermediate.append(output)
 
         if self.return_intermediate:
-            return torch.stack(intermediate)
+            # 【修改点】：一同返回 attn_weights
+            return torch.stack(intermediate), attn_weights
 
-        return output.unsqueeze(0)
+        # 【修改点】：一同返回 attn_weights
+        return output.unsqueeze(0), attn_weights
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -187,7 +186,6 @@ class TransformerEncoderLayer(nn.Module):
                  activation="relu", normalize_before=False):
         super().__init__()
         self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout)
-        # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -215,7 +213,6 @@ class TransformerEncoderLayer(nn.Module):
         src2, corr = self.self_attn(q, k, value=src, attn_mask=src_mask,
                               key_padding_mask=src_key_padding_mask)
         
-
         src = src + self.dropout1(src2)
         src = self.norm1(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
@@ -254,7 +251,6 @@ class TransformerDecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout)
         self.multihead_attn = MultiheadAttention(d_model, nhead, dropout=dropout)
-        # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -292,6 +288,7 @@ class TransformerDecoderLayer(nn.Module):
             tgt = tgt + self.dropout1(tgt2)
             tgt = self.norm1(tgt)
 
+        # 【修改点】：保存交叉注意力的 weights 为 sim_mat_2
         tgt2, sim_mat_2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
                                 key=self.with_pos_embed(memory, pos),
                                 value=memory, attn_mask=memory_mask,
@@ -303,7 +300,9 @@ class TransformerDecoderLayer(nn.Module):
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
-        return tgt
+        
+        # 【修改点】：返回特征 tgt 和 交叉注意力矩阵 sim_mat_2
+        return tgt, sim_mat_2
 
     def forward_pre(self, tgt, memory,
                     tgt_mask: Optional[Tensor] = None,
@@ -319,16 +318,22 @@ class TransformerDecoderLayer(nn.Module):
 
         tgt = tgt + self.dropout1(tgt2)
         tgt2 = self.norm2(tgt)
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
+        
+        # 【修改点】：拆包接收 multihead_attn 的结果
+        out_tuple = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
                                    key=self.with_pos_embed(memory, pos),
                                    value=memory, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]
+                                   key_padding_mask=memory_key_padding_mask)
+        tgt2 = out_tuple[0]
+        sim_mat_2 = out_tuple[1]
                             
         tgt = tgt + self.dropout2(tgt2)
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
         tgt = tgt + self.dropout3(tgt2)
-        return tgt
+        
+        # 【修改点】：返回特征 tgt 和 交叉注意力矩阵 sim_mat_2
+        return tgt, sim_mat_2
 
     def forward(self, tgt, memory,
                 tgt_mask: Optional[Tensor] = None,

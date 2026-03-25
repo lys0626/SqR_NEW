@@ -22,7 +22,9 @@ from lib.utils.slconfig import get_raw_dict
 
 # 引入 RoLT 模块
 from rolt_handler import RoLT_Handler
-
+# === 新增 ASL 导入 ===
+from lib.models.aslloss import AsymmetricLossOptimized
+from lib.utils.slconfig import get_raw_dict
 def sec_to_str(seconds):
     seconds = int(seconds)
     m, s = divmod(seconds, 60)
@@ -32,7 +34,7 @@ def parser_args():
     parser = argparse.ArgumentParser(description='Query2Label NIH Training (Stage 1 - Data Cleaning)')
     parser.add_argument('--dataname', help='dataname', default='nih', choices=['coco14', 'mimic', 'nih'])
     parser.add_argument('--dataset_dir', help='dir of dataset', default='/comp_robot')
-    parser.add_argument('--img_size', default=224, type=int, help='size of input images')
+    parser.add_argument('--img_size', default=448, type=int, help='size of input images')
 
     parser.add_argument('--output', metavar='DIR', help='path to output folder')
     parser.add_argument('--num_class', default=14, type=int, help="Number of query slots")
@@ -44,6 +46,20 @@ def parser_args():
     parser.add_argument('--gamma', default=0.1, type=float, help='Multiplicative factor of learning rate decay for StepLR')
     parser.add_argument('--momentum', default=0.9, type=float, metavar='M', help='momentum')
     
+    # loss
+    parser.add_argument('--eps', default=1e-5, type=float,
+                        help='eps for focal loss (default: 1e-5)')
+    parser.add_argument('--dtgfl', action='store_true', default=False, 
+                        help='disable_torch_grad_focal_loss in asl')              
+    parser.add_argument('--gamma_pos', default=0, type=float,
+                        metavar='gamma_pos', help='gamma pos for simplified asl loss')
+    parser.add_argument('--gamma_neg', default=2, type=float,
+                        metavar='gamma_neg', help='gamma neg for simplified asl loss')
+    parser.add_argument('--loss_dev', default=-1, type=float,
+                                            help='scale factor for loss')
+    parser.add_argument('--loss_clip', default=0.0, type=float,
+                                            help='scale factor for clip')  
+
     parser.add_argument('-j', '--workers', default=8, type=int, metavar='N', help='number of data loading workers')
     parser.add_argument('--epochs', default=80, type=int, metavar='N', help='number of total epochs to run')
     parser.add_argument('--val_interval', default=1, type=int, metavar='N', help='interval of validation')
@@ -127,7 +143,16 @@ def main_worker(args, logger):
     model = model.cuda()
     ema_m = ModelEma(model, args.ema_decay) 
 
-    criterion = torch.nn.BCEWithLogitsLoss()
+    # === 修改损失函数 ===
+    # 原代码: criterion = torch.nn.BCEWithLogitsLoss()
+    # 替换为:
+    criterion = AsymmetricLossOptimized(
+        gamma_neg=args.gamma_neg,          # 对负样本施加更强的焦点惩罚，降低大量易分类负样本的权重
+        gamma_pos=args.gamma_pos,          # 正样本保持较小的焦点惩罚，保证长尾类别正样本的梯度
+        clip=args.loss_clip,            # 将预测概率小于 0.05 的负样本梯度截断，有效防止噪声负标签干扰
+        disable_torch_grad_focal_loss=args.dtgfl # 节省显存
+    )
+    # ===================
 
     # 2. 优化器分组 (去掉 .module)
     base_lr = args.lr
@@ -218,21 +243,23 @@ def main_worker(args, logger):
     for epoch in range(args.start_epoch, args.epochs):
         torch.cuda.empty_cache()
         
-        need_run_rolt = (epoch <= args.splicemix_start_epoch) or (not clean_mask_dict)
-        if need_run_rolt:
+        # need_run_rolt = (epoch <= args.splicemix_start_epoch) or (not clean_mask_dict)
+        # if need_run_rolt:
+        #     clean_mask_dict, soft_label_dict = rolt_handler.step(epoch)
+        if(epoch >= args.rolt_start_epoch):
             clean_mask_dict, soft_label_dict = rolt_handler.step(epoch)
-            
-        # [核心] 提取完干净索引，直接保存并退出整个 Stage 1 脚本
-        if epoch == args.splicemix_start_epoch:
-            logger.info(f" >>> [Stage 1 Complete] Epoch {epoch} reached. Saving clean indices... <<<")
-            clean_indices = [idx for idx, is_clean in clean_mask_dict.items() if is_clean]
-            save_path = os.path.join(args.output, 'clean_indices.pt')
-            torch.save(clean_indices, save_path)
-            logger.info(f" >>> Saved {len(clean_indices)} clean samples to {save_path}. Exiting Stage 1 gracefully! <<<")
-            # 【修复代码】防止 PyTorch 多进程 DataLoader 在清理时引发非 0 退出码
-            import sys
-            sys.stdout.flush() # 强制刷新控制台输出缓冲区，防止日志被截断
-            sys.exit(0)        # 强行以 0 (成功) 状态码退出，顺利向外层的 bash set -e 交差
+
+        # # [核心] 提取完干净索引，直接保存并退出整个 Stage 1 脚本
+        # if epoch == args.splicemix_start_epoch:
+        #     logger.info(f" >>> [Stage 1 Complete] Epoch {epoch} reached. Saving clean indices... <<<")
+        #     clean_indices = [idx for idx, is_clean in clean_mask_dict.items() if is_clean]
+        #     save_path = os.path.join(args.output, 'clean_indices.pt')
+        #     torch.save(clean_indices, save_path)
+        #     logger.info(f" >>> Saved {len(clean_indices)} clean samples to {save_path}. Exiting Stage 1 gracefully! <<<")
+        #     # 【修复代码】防止 PyTorch 多进程 DataLoader 在清理时引发非 0 退出码
+        #     import sys
+        #     sys.stdout.flush() # 强制刷新控制台输出缓冲区，防止日志被截断
+        #     sys.exit(0)        # 强行以 0 (成功) 状态码退出，顺利向外层的 bash set -e 交差
             
         model.train()
         for param in model.parameters():
@@ -278,8 +305,13 @@ def main_worker(args, logger):
             losses.update(val_loss)
             mAUCs.update(mAUC)
 
-            # Stage 1 都是预热，不评选 best
-            is_best = False
+            # ================= 【修改 1: 激活最佳模型评选】 =================
+            # 原代码: is_best = False
+            is_best = mAUC > best_mAUC
+            if is_best:
+                best_mAUC = mAUC
+                logger.info(f" *** New Best Model found! mAUC: {best_mAUC:.4f} ***")
+            # ================================================================
 
             timestamp = datetime.datetime.now().strftime('%m-%d %H:%M:%S')
             log_prefix = f"[0|{timestamp}]"
@@ -302,7 +334,38 @@ def main_worker(args, logger):
                 'state_dict': model.state_dict(),
                 'optimizer' : optimizer.state_dict(),
             }, is_best=is_best, filename=os.path.join(args.output, 'checkpoint.pth.tar'))
-
+            # ================= 【修改 2: 在 Epoch 末尾执行最终提纯与退出】 =================
+            if epoch == args.splicemix_start_epoch:
+                logger.info(f"\n>>> [Stage 1 Complete] Epoch {epoch} reached. Preparing definitive dataset split... <<<")
+                
+                # A. 加载刚刚保存的最强模型 (Best Model)
+                best_model_path = os.path.join(args.output, 'model_best.pth.tar')
+                logger.info(f"    -> Loading best model weights from {best_model_path}")
+                checkpoint = torch.load(best_model_path, map_location='cuda')
+                model.load_state_dict(checkpoint['state_dict'])
+                
+                # B. 用最强模型跑最后一次完整的体检与清洗
+                logger.info("    -> Running final RoLT filtering using the BEST model...")
+                
+                final_clean_mask_dict, final_soft_label_dict, noise_clean_labels_dict = rolt_handler.step(epoch="FINAL_BEST")
+                
+                # C. 保存最终结果供 Stage 2 及 CAM 生成脚本使用
+                clean_indices = [idx for idx, is_clean in final_clean_mask_dict.items() if is_clean]
+                noisy_indices = [idx for idx, is_clean in final_clean_mask_dict.items() if not is_clean]
+                
+                torch.save(clean_indices, os.path.join(args.output, 'clean_indices.pt'))
+                torch.save(noisy_indices, os.path.join(args.output, 'noisy_indices.pt'))
+                
+                # 保存噪声样本中的干净标签索引字典！
+                torch.save(noise_clean_labels_dict, os.path.join(args.output, 'noise_clean_labels_dict.pt'))
+                
+                logger.info(f" >>> Split complete! Clean: {len(clean_indices)}, Noisy: {len(noisy_indices)}.")
+                logger.info(" >>> Exiting Stage 1 gracefully! You can now run the CAM mask generation script. <<<")
+                
+                import sys
+                sys.stdout.flush() 
+                sys.exit(0)        
+            # =================================================================================
 def train(train_loader, model, ema_m, criterion, optimizer, scheduler, epoch, args, clean_mask_dict, soft_label_dict):
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
     losses = AverageMeter('Loss', ':5.3f')

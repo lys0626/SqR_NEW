@@ -49,7 +49,7 @@ class nihchest(Dataset):
         labels_np = self.df[self.label_names].values.astype(np.float32)
         
         # 指定图片文件夹路径
-        img_folder = os.path.join(self.root, 'img_224')
+        img_folder = os.path.join(self.root, 'img_512')
         if not os.path.exists(img_folder):
             print(f"Warning: Image folder not found at {img_folder}!")
 
@@ -81,21 +81,6 @@ class nihchest(Dataset):
 
         self.y = np.array(self.labels)
         self.classes = self.label_names
-
-        # 3. 计算正负样本权重 (Loss Balancing),代码中并没用采用
-        # if len(self.y) > 0:
-        #     pos_counts = np.sum(self.y, axis=0)
-        #     neg_counts = len(self.y) - pos_counts
-            
-        #     # 防止除零
-        #     pos_counts = np.where(pos_counts == 0, 1, pos_counts)
-        #     neg_counts = np.where(neg_counts == 0, 1, neg_counts)
-            
-        #     weight_pos = 1.0 / pos_counts
-        #     weight_neg = 1.0 / neg_counts
-        #     self.weight = np.stack([weight_neg, weight_pos], axis=1)
-        # else:
-        #     self.weight = np.ones((len(self.classes), 2))
 
     def get_number_classes(self):
         return self.num_labels

@@ -17,7 +17,7 @@ def get_datasets(args):
                                      std=[0.229, 0.224, 0.225])
         # print("mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]")
 
-    train_data_transform_list = [transforms.Resize((args.img_size, args.img_size)),
+    train_data_transform_list = [transforms.RandomCrop((args.img_size, args.img_size)),     # 2. 随机裁剪出 448x448 的核心区域
                                             AutoAugment(),
                                                transforms.ToTensor(),
                                                normalize]
@@ -31,7 +31,7 @@ def get_datasets(args):
     train_data_transform = transforms.Compose(train_data_transform_list)
 
     test_data_transform = transforms.Compose([
-                                            transforms.Resize((args.img_size, args.img_size)),
+                                            transforms.CenterCrop((args.img_size, args.img_size)),
                                             transforms.ToTensor(),
                                             normalize])
     
