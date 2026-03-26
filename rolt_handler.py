@@ -7,19 +7,12 @@ import math
 import matplotlib.pyplot as plt
 from scipy.stats import norm
 import os
-import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.manifold import TSNE
 
-import os
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.manifold import TSNE
 
 def plot_feature_tsne(feats, targets, class_idx, epoch, class_names=None, save_dir="./diagnostics"):
     """
@@ -207,7 +200,7 @@ class RoLT_Handler(object):
         
         # 存储上一轮的 clean mask 以便 momentum 更新 (可选，此处暂未实现以保持简单)
         self.prob_history = torch.zeros(len(train_loader.dataset)).to(self.device)
-    def step_knn(self, epoch):
+    def step(self, epoch):
         print(f"\n==> [RoLT] Epoch {epoch}: Starting Logic Flow...")
         
         # 1. 提取完整特征 (注意：这里必须是你之前修改过的、没有 mask 归零的特征！)
@@ -248,7 +241,7 @@ class RoLT_Handler(object):
         
         print(f"==> [RoLT] Epoch {epoch}: Logic Flow Finished.\n")
         return clean_mask_dict, soft_label_dict
-    def step(self, epoch):
+    def step_center(self, epoch):
         """
         每个 Epoch 开始时调用。
         执行：特征提取 -> Masking -> 原型计算 -> GMM 清洗 -> 样本筛选 -> 软标签生成
@@ -279,17 +272,9 @@ class RoLT_Handler(object):
         # 为“噪声样本”生成用于校正的软标签
         # 返回: {sample_index: soft_targets(Tensor)}
         soft_label_dict = self.generate_soft_labels(all_feats, all_logits, all_targets, all_indices, clean_mask_dict, label_clean_matrix)       
-        # 生成 noise_clean_labels_dict
-        noise_clean_labels_dict = {}
-        idx_cpu = all_indices.cpu().numpy()
-        for i, idx in enumerate(idx_cpu):
-            if not clean_mask_dict[idx]: # 如果是噪声样本
-                # 该样本中：标签原本为1 且 被GMM/KNN判定为干净的 类别索引
-                is_tp_clean = (all_targets[i] == 1) & label_clean_matrix[i].cpu()
-                clean_classes = torch.where(is_tp_clean)[0].tolist()
-                noise_clean_labels_dict[idx] = clean_classes
         print(f"==> [RoLT] Epoch {epoch}: Logic Flow Finished.\n")
-        return clean_mask_dict, soft_label_dict, noise_clean_labels_dict
+        
+        return clean_mask_dict, soft_label_dict
     def step_loss(self, epoch):
         print(f"\n==> [RoLT] Epoch {epoch}: Starting Logic Flow (Small-Loss Criterion)...")
         
@@ -361,7 +346,7 @@ class RoLT_Handler(object):
                 all_indices.append(indices.cpu())
                 
         # 拼接
-        all_feats = torch.cat(all_feats, dim=0)     # [N, C, D]
+        all_feats = torch.cat(all_feats, dim=0).to(self.device)     # [N, C, D]
         all_logits = torch.cat(all_logits, dim=0).to(self.device) # [新增]
         all_targets = torch.cat(all_targets, dim=0).to(self.device) # [N, C]
         all_indices = torch.cat(all_indices, dim=0).to(self.device) # [N]
@@ -380,8 +365,9 @@ class RoLT_Handler(object):
             pos_indices = (targets[:, c] == 1)
             
             if pos_indices.sum() > 0:
-                # 【修改】：用 .cpu() 取出索引，切片后再送入 GPU
-                class_feats = feats[pos_indices.cpu(), c, :].to(self.device) 
+                # 取出对应的特征向量 (已经是 masked 的，非 0)
+                class_feats = feats[pos_indices, c, :] 
+                # L2 归一化 (RoLT 中常用的操作，防止模长影响距离)
                 class_feats = F.normalize(class_feats, p=2, dim=1)
                 
                 # 计算均值并归一化更新
@@ -431,7 +417,7 @@ class RoLT_Handler(object):
             # ========================================================
                 
             # 提取所有样本的类别c的特征并归一化
-            class_feats = feats[:, c, :].to(self.device) 
+            class_feats = feats[:, c, :] 
             class_feats = F.normalize(class_feats, p=2, dim=1)
             
             chunk_size = 2048
@@ -485,7 +471,7 @@ class RoLT_Handler(object):
                 continue
                 
             # 获取特征并归一化
-            class_feats = feats[pos_indices.cpu(), c, :].to(self.device)
+            class_feats = feats[pos_indices, c, :]
             class_feats = F.normalize(class_feats, p=2, dim=1)
             
             # 计算到原型的 Cosine Distance (1 - Cosine Similarity)
@@ -524,9 +510,7 @@ class RoLT_Handler(object):
                 # 需要复杂的索引映射
                 full_indices = torch.where(pos_indices)[0]
                 # 仅将判定为 Clean 的位置设为 True
-                # 将 numpy 的 bool 数组转为 torch tensor，并移到 GPU 上，再进行索引
-                is_clean_tensor = torch.from_numpy(is_clean_subset).to(self.device)
-                clean_indices = full_indices[is_clean_tensor]
+                clean_indices = full_indices[is_clean_subset]
                 label_clean_matrix[clean_indices, c] = True
                 
             except Exception as e:
@@ -573,13 +557,9 @@ class RoLT_Handler(object):
                 # 设定阈值 0.5 判定是否 Clean
                 is_clean_subset = (prob_clean > 0.5)
                 
-                # ================= 修复核心 =================
-                full_indices = torch.where(pos_indices)[0] # 在 GPU 上
-                # 将 numpy 的 bool 数组转为 torch tensor，并移到 GPU 上，再进行索引
-                is_clean_tensor = torch.from_numpy(is_clean_subset).to(self.device)
-                
-                clean_indices = full_indices[is_clean_tensor]
-                # ============================================
+                # 填回大矩阵
+                full_indices = torch.where(pos_indices)[0]
+                clean_indices = full_indices[is_clean_subset]
                 label_clean_matrix[clean_indices, c] = True
                 
             except Exception as e:
@@ -658,7 +638,7 @@ class RoLT_Handler(object):
             valid_indices = (targets[:, c] == 1) & is_sample_trustworthy
             
             if valid_indices.sum() > 0:
-                class_feats = feats[valid_indices.cpu(), c, :].to(self.device)
+                class_feats = feats[valid_indices, c, :]
                 class_feats = F.normalize(class_feats, p=2, dim=1)
                 proto = class_feats.mean(dim=0)
                 new_prototypes[c] = F.normalize(proto, p=2, dim=0)
@@ -688,7 +668,7 @@ class RoLT_Handler(object):
             return soft_label_dict
                 
         # 提取 Noisy 样本的相关数据
-        noisy_feats = feats[noisy_indices_loc.cpu()].to(self.device)     # [M, C, D]
+        noisy_feats = feats[noisy_indices_loc]     # [M, C, D]
         noisy_logits = logits[noisy_indices_loc]   # [M, C]
         noisy_targets = targets[noisy_indices_loc] # [M, C] (原始标签)
         

@@ -21,7 +21,6 @@ class mimic(Dataset):
         'Fracture', 'Pleural other'
     ]
     num_labels = len(classes) # 13
-
     def __init__(self, root='', mode='train', transform=None):
         """
         :param root: 数据集的根目录，例如 /data/mimic_cxr/PA
@@ -66,7 +65,7 @@ class mimic(Dataset):
         # 校验一下
         if self.y.shape[1] != self.num_labels:
              print(f"警告: CSV 中的列数 ({self.y.shape[1]}) 与代码定义的类别数 ({self.num_labels}) 不匹配！")
-
+        
     def get_number_classes(self):
         return self.num_labels
 

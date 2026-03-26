@@ -6,6 +6,10 @@ from utilities_s2 import utils, metric, utils_ddp, warmup, logger
 from SpliceMix import SpliceMix
 import models_s2 as models
 from models_s2.SpliceMix_CL import Loss_fn
+# ================= 新增：引入 CAM 模块 =================
+from models_s2.cam_splicemix import CAMSpliceMixer
+from models_s2.loss_fns import Loss_fn_CAM
+# =======================================================
 class Engine(object):
     def __init__(self, args):
         super(Engine, self).__init__()
@@ -42,7 +46,10 @@ class Engine(object):
         self.model = getattr(models, self.args.model).model(self.args.num_classes, args=args).to(self.rank)
         self.optimizer = utils.get_optimizer(self.args, self.model)
         self.loss_fn = getattr(models, self.args.model).Loss_fn().to(self.rank)
-
+        # ================= 新增：初始化双轨制所需组件 =================
+        self.cam_mixer = CAMSpliceMixer()
+        self.criterion_cam = Loss_fn_CAM().to(self.rank)
+        # =============================================================
         self.train_loader, self.test_loader = utils.get_dataloader(train_set=self.dataset['train'],
                                                        test_set=self.dataset['test'], args=self.args)
         if self.args.warmup_epochs > 0:
@@ -70,9 +77,93 @@ class Engine(object):
             torch.cuda.empty_cache()
 
             for i, data in enumerate(train_loader):
-                inputs, targets, targets_gt, file_name = self.on_start_batch(data)
-                outputs, loss = self.on_forward(inputs, targets, file_name, is_train=True)
-                self.on_end_batch(outputs, targets_gt.data, loss.data, file_name)
+                inputs, targets, targets_gt, file_name, is_clean, cam_masks = self.on_start_batch(data)
+                self.optimizer.zero_grad()
+                total_loss = 0.0
+                
+                clean_mask = is_clean.bool()
+                noisy_mask = ~clean_mask
+                
+                # 准备一个空 tensor，用于组装整个 batch 的 output 传给 on_end_batch 统计指标
+                outputs_all = torch.zeros((inputs.size(0), self.args.num_classes), device=self.rank)
+
+                # =========================================================
+                # 轨道一：干净样本 (完全保留原版的前向逻辑)
+                # =========================================================
+                if clean_mask.sum() > 0:
+                    img_c = inputs[clean_mask]
+                    tgt_c = targets[clean_mask]
+                    
+                    with autocast(enabled=not self.args.disable_amp):
+                        if 'SpliceMix' in self.args.mixer:
+                            img_c_mix, tgt_c_mix, flag = self.mixer(img_c, tgt_c)
+                        else:
+                            img_c_mix, tgt_c_mix, flag = img_c, tgt_c, None
+                            
+                        args_model = {'flag': flag} if self.args.model in ['SpliceMix_CL'] and flag else {}
+                        outputs_c = self.model(img_c_mix, args=args_model)
+                        loss_clean = self.loss_fn(outputs_c, tgt_c_mix)
+                    
+                    # 按数量比例加权
+                    weight_c = clean_mask.sum().float() / inputs.size(0)
+                    total_loss += loss_clean * weight_c
+                    
+                    # 把 output 塞回指定位置
+                    out_c_flat = outputs_c[0] if isinstance(outputs_c, tuple) else outputs_c
+                    outputs_all[clean_mask] = out_c_flat[:img_c.size(0)].data
+
+                # =========================================================
+                # 轨道二：噪声样本 (触发 CAM 拼接和局部对齐约束)
+                # =========================================================
+                if noisy_mask.sum() > 0:
+                    img_n = inputs[noisy_mask]
+                    tgt_n = targets[noisy_mask]
+                    mask_n = cam_masks[noisy_mask]
+                    
+                    # 1. 无梯度前向，拿到母体预测值
+                    with torch.no_grad():
+                        with autocast(enabled=not self.args.disable_amp):
+                            mother_preds = self.model(img_n)
+                            mother_preds = mother_preds[0] if isinstance(mother_preds, tuple) else mother_preds
+                    
+                    soft_targets_pools = torch.stack([torch.roll(mother_preds, shifts=s, dims=0) for s in range(4)], dim=1)
+                    
+                    # 2. 物理图块拼接
+                    X_syn, Y_syn, source_grid = self.cam_mixer(img_n, tgt_n, mask_n)
+                    
+                    # 3. 走新轨道，要求网络输出各个 patch 的预测
+                    with autocast(enabled=not self.args.disable_amp):
+                        outputs_n_overall, preds_patches = self.model(X_syn, args={'return_patches': True})
+                        
+                        # 4. 计算 Base Loss 与 CAM 局部对齐 Loss
+                        loss_noisy_base = self.loss_fn(outputs_n_overall, Y_syn)
+                        loss_noisy_cam = self.criterion_cam(preds_patches, soft_targets_pools, source_grid)
+                        
+                        loss_noisy = loss_noisy_base + loss_noisy_cam
+                        
+                    weight_n = noisy_mask.sum().float() / inputs.size(0)
+                    total_loss += loss_noisy * weight_n
+                    
+                    # 把 output 塞回指定位置
+                    out_n_flat = outputs_n_overall[0] if isinstance(outputs_n_overall, tuple) else outputs_n_overall
+                    outputs_all[noisy_mask] = out_n_flat.data
+
+                # =========================================================
+                # 梯度的统一反向传播与状态更新
+                # =========================================================
+                if isinstance(total_loss, torch.Tensor) and total_loss.item() > 0:
+                    self.scaler.scale(total_loss).backward()
+                    if self.args.disable_amp:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                if self.args.warmup_epochs > 0 and self.epoch <= self.args.warmup_epochs:
+                    self.warmup_scheduler.step()
+
+                # 将组装好的 outputs_all 传给 on_end_batch 以维持原有的 AP 统计逻辑
+                self.on_end_batch(outputs_all, targets_gt.data, 
+                                  total_loss.data if isinstance(total_loss, torch.Tensor) else torch.tensor(total_loss), 
+                                  file_name)
 
             self.on_end_epoch(is_train=True, result=self.result['train'])
             self.lr_scheduler.step()
@@ -88,36 +179,20 @@ class Engine(object):
         self.on_start_epoch(epoch)
         
         for i, data in enumerate(val_loader):
-            inputs, targets, targets_gt, file_name = self.on_start_batch(data)
+            # 验证阶段不触发双轨，老老实实走原来的方法
+            inputs, targets, targets_gt, file_name, _, _ = self.on_start_batch(data)
             outputs, loss = self.on_forward(inputs, targets, file_name, is_train=False)
             self.on_end_batch(outputs, targets_gt.data, loss.data, file_name)
 
         self.on_end_epoch(is_train=False, result=self.result['val'], result_best=self.result['val_best'])
 
     def on_forward(self, inputs, targets, file_name, is_train):
-        args = {}
-        if is_train:
+        # 训练过程的 forward 已经在 train() 中展开，这里只剩下验证时的干净前向逻辑
+        args_model = {}
+        with torch.no_grad():
             with autocast(enabled=not self.args.disable_amp):
-                if 'SpliceMix' in self.args.mixer:
-                    inputs, targets, flag = self.mixer(inputs, targets)
-                if self.args.model in ['SpliceMix_CL']: args = {'flag': flag,}
-                outputs = self.model(inputs, args)
+                outputs = self.model(inputs, args_model)
                 loss = self.loss_fn(outputs, targets)
-
-            self.optimizer.zero_grad()
-            self.scaler.scale(loss).backward()
-            if self.args.disable_amp:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-
-            if self.args.warmup_epochs > 0 and self.epoch <= self.args.warmup_epochs:
-                self.warmup_scheduler.step()
-        else:
-            with torch.no_grad():
-                with autocast(enabled=not self.args.disable_amp):
-                    outputs = self.model(inputs, args)
-                    loss = self.loss_fn(outputs, targets)
 
         outputs = outputs[0][:inputs.shape[0]].data if type(outputs) == tuple else outputs[:inputs.shape[0]].data
         return outputs, loss
@@ -128,8 +203,13 @@ class Engine(object):
         file_name = data['name']
         targets = targets_gt.clone().to(self.rank)
         targets[targets == -1] = 0
-        return inputs, targets, targets_gt, file_name
-
+        
+        # ================= 【新增】：以字典安全 get 方式提取双轨标志 =================
+        # 这样即使您之后更换验证集或其他没有传这两个字段的 Dataset，也不会报错
+        is_clean = data.get('is_clean', torch.ones(inputs.size(0), dtype=torch.bool)).to(self.rank)
+        cam_masks = data.get('cam_mask', torch.ones((inputs.size(0), 2, 2), dtype=torch.bool)).to(self.rank)
+        # ============================================================================
+        return inputs, targets, targets_gt, file_name, is_clean, cam_masks
     def on_end_batch(self, outputs, targets_gt, loss, image_name=''):
         bs = self.args.batch_size
         if self.args.distributed:
