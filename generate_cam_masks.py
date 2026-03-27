@@ -11,7 +11,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Offline CAM 2x2 Mask Generation')
     parser.add_argument('--dataname', default='mimic', choices=['mimic', 'nih'])
     parser.add_argument('--dataset_dir', default='/data/mimic_cxr/PA/7_1_2')
-    parser.add_argument('--output', metavar='DIR', help='path to Stage 1 output folder (e.g. ./experiment/ASL/...)')
+    parser.add_argument('--output', metavar='DIR', help='path to Stage 1 output folder')
     parser.add_argument('--num_class', default=13, type=int)
     parser.add_argument('-j', '--workers', default=8, type=int)
     parser.add_argument('-b', '--batch-size', default=128, type=int)
@@ -32,6 +32,14 @@ def parse_args():
     parser.add_argument('--position_embedding', default='sine', type=str)
     parser.add_argument('--orid_norm', action='store_true', default=False)
     
+    # 【修复 1】：补齐缺失的 pretrained 参数，防止 build_backbone 崩溃
+    parser.add_argument('--pretrained', action='store_true', default=False)
+    # ================= 【修复：底层 Dataset 所需的兼容占位参数】 =================
+    parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', default=False, help='evaluate model on validation set')
+    parser.add_argument('--cutout', action='store_true', default=False, help='Use cutout')
+    parser.add_argument('--n_holes', type=int, default=1, help='number of holes for cutout')
+    parser.add_argument('--length', type=int, default=16, help='length of holes for cutout')
+    # =========================================================================
     return parser.parse_args()
 
 def main():
@@ -55,14 +63,14 @@ def main():
 
     print("==> Initializing DataLoader (Shuffle=False)...")
     train_dataset, _ = get_datasets(args)
+    
     # 重点：必须 shuffle=False
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
     noise_cam_masks = {}
-    
-    threshold = 0.20 # 因为 4 个格子和为 1，平均是 0.25。0.20 是一个安全阈值，确保抓住主体病灶
+    threshold = 0.20 # 抓取主体病灶的安全阈值
 
     with torch.no_grad():
         for images, targets, indices in tqdm(train_loader, desc="Extracting CAM 2x2 Masks"):
@@ -70,40 +78,52 @@ def main():
             
             # 开启 return_attn
             _, _, _, src, attn_weights = model(images, return_attn=True)
-            
-            # src 维度 [Batch, 2048, H, W] -> 通常 448 输入对应 H=14, W=14
             H, W = src.shape[-2], src.shape[-1]
             
             # 遍历 Batch 内部
             for b in range(images.size(0)):
                 global_idx = indices[b].item()
                 
-                # 如果是干净样本，直接跳过，它不需要 CAM
+                # 如果是干净样本，直接跳过
                 if global_idx not in noisy_indices_set:
                     continue
                     
-                noise_cam_masks[global_idx] = {}
-                clean_classes = noise_clean_labels_dict.get(global_idx, [])
+                # 【修复 2】：解析 Stage 1 传来的纯净硬标签 Tensor
+                clean_labels_tensor = noise_clean_labels_dict.get(global_idx, None)
+                if clean_labels_tensor is None:
+                    continue
                 
-                for c in clean_classes:
-                    # 获取该样本、该类的注意力图 [H*W]
-                    # PyTorch MultiheadAttention 返回的维度通常为 [Batch, Num_Queries, Source_Len]
-                    cls_attn = attn_weights[b, c, :] 
+                # 获取被判定为阳性的真实类别索引 (例如: [0, 3] 代表 Infiltration 和 Nodule)
+                clean_class_indices = torch.where(clean_labels_tensor > 0.5)[0]
+                
+                if len(clean_class_indices) == 0:
+                    # 如果提纯后没有任何阳性标签，赋予一个默认的全 False 掩码
+                    noise_cam_masks[global_idx] = torch.zeros((2, 2), dtype=torch.bool)
+                    continue
+
+                # 【修复 3】：初始化一个 2x2 全局掩码，对多种疾病的病灶取并集
+                combined_mask = torch.zeros((2, 2), dtype=torch.bool)
+                
+                for c in clean_class_indices:
+                    cls_idx = c.item()
+                    cls_attn = attn_weights[b, cls_idx, :] 
                     
-                    # 恢复为二维空间 [1, 1, H, W]
+                    # 恢复为二维空间
                     cls_attn_2d = cls_attn.view(1, 1, H, W)
                     
                     # 极速自适应池化到 2x2
-                    grid_energy = F.adaptive_avg_pool2d(cls_attn_2d, (2, 2)).squeeze() # [2, 2]
+                    grid_energy = F.adaptive_avg_pool2d(cls_attn_2d, (2, 2)).squeeze() 
                     
                     # 归一化使得 4 个格子概率和为 1
                     grid_energy = grid_energy / (grid_energy.sum() + 1e-8)
                     
-                    # 布尔掩码判定 (True 代表有病灶，需要抠图)
+                    # 布尔掩码判定
                     mask_2x2 = grid_energy >= threshold
                     
-                    # 存入字典 (转移到 CPU 节省内存)
-                    noise_cam_masks[global_idx][c] = mask_2x2.cpu()
+                    # 取并集 (OR)：只要任意一个疾病在这里有病灶，这个格子就可以用来抠图！
+                    combined_mask = combined_mask | mask_2x2.cpu()
+                    
+                noise_cam_masks[global_idx] = combined_mask
 
     save_path = os.path.join(args.output, 'noise_cam_masks.pt')
     torch.save(noise_cam_masks, save_path)

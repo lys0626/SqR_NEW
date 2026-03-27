@@ -96,7 +96,8 @@ class Loss_fn(loss_fns.BCELoss):
         self.bce = self.loss_fn
 
     def forward(self, inputs, targets):
-        if len(inputs) == 3:
+        # 【修复】：增加 isinstance 判断，严格确保它是 Tuple
+        if isinstance(inputs, tuple) and len(inputs) == 3:
             preds, preds_m, preds_m_r = inputs
             loss_bce = self.bce(preds, targets)
             if targets.shape[-1] == 20:  # for VOC2007

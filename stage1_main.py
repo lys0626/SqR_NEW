@@ -247,7 +247,7 @@ def main_worker(args, logger):
         # if need_run_rolt:
         #     clean_mask_dict, soft_label_dict = rolt_handler.step(epoch)
         if(epoch >= args.rolt_start_epoch):
-            clean_mask_dict, soft_label_dict = rolt_handler.step(epoch)
+            clean_mask_dict, soft_label_dict,noise_clean_labels_dict = rolt_handler.step(epoch)
 
         # # [核心] 提取完干净索引，直接保存并退出整个 Stage 1 脚本
         # if epoch == args.splicemix_start_epoch:

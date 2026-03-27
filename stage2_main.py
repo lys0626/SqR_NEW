@@ -44,6 +44,10 @@ parser.add_argument('-Sprob', default=1., type=float, help="thersold for using S
 parser.add_argument('-rmk', '--remark', default='', type=str, help="etc")
 parser.add_argument('--clean_mask_path', default='', type=str, help="Stage 1 生成的干净样本索引路径")
 
+
+parser.add_argument('--clean_idx_path', default='', type=str, help="Stage 1 生成的干净样本索引路径")
+parser.add_argument('--noisy_idx_path', default='', type=str, help="Stage 1 生成的噪声样本索引路径")
+parser.add_argument('--cam_mask_path', default='', type=str, help="生成的 CAM masks 路径")
 def run_training(args):
 
     engine = Engine(args)

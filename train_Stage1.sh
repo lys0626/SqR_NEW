@@ -3,7 +3,7 @@
 # set -e  # <--- [强烈建议新增] 只要发生任何报错，脚本立刻停止，绝不往下瞎跑！
 
 # ================= 1. 基础全局配置 =================
-GPU_ID=4
+GPU_ID=2
 # export CUDA_VISIBLE_DEVICES=${GPU_ID}      # 指定使用的单卡 GPU 编号
 
 # DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)

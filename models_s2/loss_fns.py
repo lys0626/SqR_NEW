@@ -17,21 +17,25 @@ class Loss_fn_CAM(nn.Module):
 
     def forward(self, preds_patches, soft_targets, source_grid):
         """
+        全张量向量化加速版本！极速运算，无 Python for 循环。
         preds_patches: (B, 4, num_classes)
-        soft_targets: (B, 4, num_classes) - 来源于 4 个 pool 的 mother_soft_target
+        soft_targets: (B, 4, num_classes)
         source_grid: (B, 2, 2)
         """
-        B = preds_patches.shape[0]
+        B, num_patches, num_classes = preds_patches.shape
+        
+        # 1. 展平网格，找到对应的 pool_idx. shape: (B, 2, 2) -> (B, 4)
         grid_flat = source_grid.view(B, 4) 
         
-        loss_cam = 0.0
-        for b in range(B):
-            for p_idx in range(4): 
-                pool_idx = grid_flat[b, p_idx] 
+        # 2. 将 grid_flat 扩展第三个维度，以便通过 gather 抽取所有的类别通道
+        # grid_expanded shape: (B, 4, num_classes)
+        grid_expanded = grid_flat.unsqueeze(-1).expand(B, 4, num_classes)
+        
+        # 3. 瞬间抽取整个 Batch 的 mother_soft_target
+        selected_soft_targets = torch.gather(soft_targets, dim=1, index=grid_expanded)
+        mother_soft_targets = torch.sigmoid(selected_soft_targets)
+        
+        # 4. 一次性计算所有的 BCE Loss 并求均值！
+        loss_cam = F.binary_cross_entropy_with_logits(preds_patches, mother_soft_targets)
                 
-                patch_pred = preds_patches[b, p_idx] 
-                mother_soft_target = torch.sigmoid(soft_targets[b, pool_idx]) 
-                
-                loss_cam += F.binary_cross_entropy_with_logits(patch_pred, mother_soft_target)
-                
-        return loss_cam / (B * 4)
+        return loss_cam

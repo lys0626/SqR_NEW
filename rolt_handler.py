@@ -239,8 +239,33 @@ class RoLT_Handler(object):
         # 6. 生成软伪标签 (包含我们之前优化的 NCM/ERM 双重校验和温和缓冲)
         soft_label_dict = self.generate_soft_labels(all_feats, all_logits, all_targets, all_indices, clean_mask_dict, label_clean_matrix)       
         
+        # ================== 核心修复 (基于 Stage 2 物理拼接特性的极简版) ==================
+        # 7. 生成专门给 Stage 2 物理拼接使用的“绝对干净硬标签字典”
+        noise_clean_labels_dict = {}
+        
+        is_sample_trustworthy = torch.tensor(
+            [clean_mask_dict[idx.item()] for idx in all_indices]
+        ).bool().to(self.device)
+        noisy_indices_loc = torch.where(~is_sample_trustworthy)[0]
+        
+        if len(noisy_indices_loc) > 0:
+            noisy_targets = all_targets[noisy_indices_loc]
+            fine_grained_clean_mask = label_clean_matrix[noisy_indices_loc]
+            
+            # 拷贝一份原始硬标签 (0 或 1)
+            hard_corrected_targets = noisy_targets.clone().float()
+            
+            # 【铁腕清理】：只要原始是 1，且 KNN 说是噪声（False），强制拉低到 0.0！
+            # 【废弃假阴性恢复】：完全不处理原本为 0 的标签，因为 Stage 2 物理拼接不需要（也不能用）疑似病灶。
+            hard_corrected_targets[(noisy_targets == 1) & (~fine_grained_clean_mask)] = 0.0
+            
+            noisy_real_indices = all_indices[noisy_indices_loc]
+            for idx, h_label in zip(noisy_real_indices, hard_corrected_targets):
+                noise_clean_labels_dict[idx.item()] = h_label.detach().cpu()
+        # ===============================================
         print(f"==> [RoLT] Epoch {epoch}: Logic Flow Finished.\n")
-        return clean_mask_dict, soft_label_dict
+        # 返回 3 个参数，完美匹配 stage1_main.py 的解包
+        return clean_mask_dict, soft_label_dict, noise_clean_labels_dict
     def step_center(self, epoch):
         """
         每个 Epoch 开始时调用。
@@ -590,7 +615,7 @@ class RoLT_Handler(object):
         noisy_counts = ((~label_clean_matrix) & valid_pos_mask).sum(dim=1)
         
         # 执行判定
-        is_sample_clean = no_finding_mask |((clean_counts) > noisy_counts)
+        is_sample_clean = no_finding_mask |((clean_counts+2) > noisy_counts)
         # 保留条件：要么是健康片子(没有标签)，要么是带病片子且正确的标签 >= 错误的标签
         # is_sample_clean = no_finding_mask | (clean_counts >= noisy_counts)
         
