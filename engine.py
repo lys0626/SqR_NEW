@@ -77,6 +77,7 @@ class Engine(object):
             torch.cuda.empty_cache()
 
             for i, data in enumerate(train_loader):
+                # 1. 解析 Batch 数据
                 inputs, targets, targets_gt, file_name, is_clean, cam_masks = self.on_start_batch(data)
                 self.optimizer.zero_grad()
                 total_loss = torch.tensor(0.0, device=self.rank)
@@ -86,6 +87,32 @@ class Engine(object):
                 
                 # 准备一个空 tensor，用于组装整个 batch 的 output 传给 on_end_batch 统计指标
                 outputs_all = torch.zeros((inputs.size(0), self.args.num_classes), device=self.rank)
+
+                # =========================================================
+                # 轨道一：干净样本 (保留原版的 SpliceMix 数据增强逻辑)
+                # =========================================================
+                if clean_mask.sum() > 0:
+                    img_c = inputs[clean_mask]
+                    tgt_c = targets[clean_mask]
+                    
+                    with autocast(enabled=not self.args.disable_amp):
+                        args_model = {}
+                        # 完美复刻原版的干净样本前向逻辑
+                        if 'SpliceMix' in self.args.mixer:
+                            img_c, tgt_c, flag = self.mixer(img_c, tgt_c)
+                            if self.args.model in ['SpliceMix_CL']: 
+                                args_model = {'flag': flag}
+                        
+                        outputs_c = self.model(img_c, args_model)
+                        loss_clean = self.loss_fn(outputs_c, tgt_c)
+                        
+                        # 解析输出并截取对应原始 batch_size 的部分（适应 Tuple 输出）
+                        out_c_flat = outputs_c[0] if isinstance(outputs_c, tuple) else outputs_c
+                        out_c_flat = out_c_flat[:clean_mask.sum()]
+                        
+                    weight_c = clean_mask.sum().float() / inputs.size(0)
+                    total_loss += loss_clean * weight_c
+                    outputs_all[clean_mask] = out_c_flat.data.float()
 
                 # =========================================================
                 # 轨道二：噪声样本 (触发 CAM 拼接和局部对齐约束)
@@ -102,12 +129,13 @@ class Engine(object):
                             mother_preds = unwrapped_model(img_n)
                             mother_preds = mother_preds[0] if isinstance(mother_preds, tuple) else mother_preds
                     
+                    # 构建 4 个方向的 soft targets 池
                     soft_targets_pools = torch.stack([torch.roll(mother_preds, shifts=s, dims=0) for s in range(4)], dim=1)
                     
-                    # 2. 物理图块拼接 (无论是普通 SpliceMix 还是 CL 都要做这步)
+                    # 2. 物理图块拼接 (CAM Splicemix)
                     X_syn, Y_syn, source_grid = self.cam_mixer(img_n, tgt_n, mask_n)
                     
-                    # 3. 动态计算 Loss：区分 SpliceMix 和 SpliceMix-CL
+                    # 3. 动态计算 Loss
                     with autocast(enabled=not self.args.disable_amp):
                         if self.args.model == 'SpliceMix_CL':
                             # 【SpliceMix-CL 分支】：走新轨道，要求网络输出各个 patch 的预测
@@ -118,14 +146,11 @@ class Engine(object):
                             
                             # 灵魂双重 Loss
                             loss_noisy = loss_noisy_base + loss_noisy_cam
-                            
                             out_n_flat = outputs_n_overall[0] if isinstance(outputs_n_overall, tuple) else outputs_n_overall
                         else:
-                            # 【普通 SpliceMix 分支】：只做物理增强，像看普通图片一样前向传播，没有对齐约束
+                            # 【普通 SpliceMix 分支】：只计算 Base Loss
                             outputs_n_overall = self.model(X_syn)
                             out_n_flat = outputs_n_overall[0] if isinstance(outputs_n_overall, tuple) else outputs_n_overall
-                            
-                            # 只计算 Base Loss
                             loss_noisy_base = self.loss_fn(outputs_n_overall, Y_syn)
                             loss_noisy = loss_noisy_base
 
@@ -144,14 +169,11 @@ class Engine(object):
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                
                 if self.args.warmup_epochs > 0 and self.epoch <= self.args.warmup_epochs:
                     self.warmup_scheduler.step()
 
-                # 将组装好的 outputs_all 传给 on_end_batch 以维持原有的 AP 统计逻辑
-                # self.on_end_batch(outputs_all, targets_gt.data, 
-                #                   total_loss.data if isinstance(total_loss, torch.Tensor) else torch.tensor(total_loss), 
-                #                   file_name)
-                # 【修复 2】使用 detach() 安全剥离计算图，确保 AverageMeter 能精确累加 float 数值
+                # 将分离的 out_c 和 out_n 完美拼接，传递给评测代码
                 safe_loss = total_loss.detach()
                 self.on_end_batch(outputs_all, targets_gt.data, safe_loss, file_name)
             self.on_end_epoch(is_train=True, result=self.result['train'])
