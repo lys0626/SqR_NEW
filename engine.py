@@ -7,9 +7,41 @@ from SpliceMix import SpliceMix
 import models_s2 as models
 from models_s2.SpliceMix_CL import Loss_fn
 # ================= 新增：引入 CAM 模块 =================
-from models_s2.cam_splicemix import CAMSpliceMixer
+from models_s2.cam_splicemix import CAMSpliceMixer_MixedLabel
 from models_s2.loss_fns import Loss_fn_CAM
 # =======================================================
+def _compute_consistency_loss(outputs_origin, outputs_syn, tgt_mask, weight=1.0):
+                    """
+                    【一致性学习Loss】
+                    
+                    在干净标签位置上，拼接后的预测应该与原始预测保持一致
+                    
+                    Args:
+                        outputs_origin: (B_n, num_classes) - 原始图像的预测
+                        outputs_syn: (B_n, num_classes) - 拼接后图像的预测
+                        tgt_mask: (B_n, num_classes) - 干净标签掩码（0/1）
+                        weight: 一致性损失权重
+                    
+                    Returns:
+                        consistency_loss: 标量损失
+                    """
+                    import torch.nn.functional as F
+                    
+                    # ✨ 只在��净标签位置计算一致性
+                    # 对于每个样本，在 tgt_mask=1 的位置上，
+                    # 拼接后的预测应该接近原始预测
+                    
+                    # 方案：MSE 损失
+                    diff = outputs_syn - outputs_origin  # [B_n, num_classes]
+                    squared_diff = diff ** 2             # [B_n, num_classes]
+                    
+                    # 应用掩码：只在干净标签位置计算
+                    masked_diff = squared_diff * tgt_mask  # [B_n, num_classes]
+                    
+                    # 求平均
+                    loss_consistency = masked_diff.sum() / (tgt_mask.sum() + 1e-8)
+                    
+                    return loss_consistency * weight
 class Engine(object):
     def __init__(self, args):
         super(Engine, self).__init__()
@@ -47,7 +79,11 @@ class Engine(object):
         self.optimizer = utils.get_optimizer(self.args, self.model)
         self.loss_fn = getattr(models, self.args.model).Loss_fn().to(self.rank)
         # ================= 新增：初始化双轨制所需组件 =================
-        self.cam_mixer = CAMSpliceMixer()
+        # ✨ 使用版本3混合标签模式
+        self.cam_mixer = CAMSpliceMixer_MixedLabel(
+            use_new_labels=True,        # 融合借用样本的新病灶
+            new_label_weight=1.0        # 完全融合（1.0）或概率融合（0.5）
+        )
         self.criterion_cam = Loss_fn_CAM().to(self.rank)
         # =============================================================
         self.train_loader, self.test_loader = utils.get_dataloader(train_set=self.dataset['train'],
@@ -117,49 +153,64 @@ class Engine(object):
                 # =========================================================
                 # 轨道二：噪声样本 (触发 CAM 拼接和局部对齐约束)
                 # =========================================================
+                # 修改后的代码（Line 120-155）
+
                 if noisy_mask.sum() > 0:
                     img_n = inputs[noisy_mask]
                     tgt_n = targets[noisy_mask]
                     mask_n = cam_masks[noisy_mask]
                     
-                    # 1. 无梯度前向，拿到母体预测值
+                    # ✨ 【新增】获取干净样本池
+                    clean_imgs = inputs[clean_mask] if clean_mask.sum() > 0 else None
+                    clean_tgts = targets[clean_mask] if clean_mask.sum() > 0 else None
+                    clean_masks_data = cam_masks[clean_mask] if clean_mask.sum() > 0 else None
+                    
+                    # 1. 无梯度前向，拿到【原始噪声图像】的预测（��于一致性对比）
                     with torch.no_grad():
                         with autocast(enabled=not self.args.disable_amp):
                             unwrapped_model = self.model.module if hasattr(self.model, 'module') else self.model
-                            mother_preds = unwrapped_model(img_n)
-                            mother_preds = mother_preds[0] if isinstance(mother_preds, tuple) else mother_preds
+                            # ✨ 【关键】保存原始图像的预测（用于一致性学习）
+                            outputs_origin_n = unwrapped_model(img_n)
+                            outputs_origin_n = outputs_origin_n[0] if isinstance(outputs_origin_n, tuple) else outputs_origin_n
                     
-                    # 构建 4 个方向的 soft targets 池
-                    soft_targets_pools = torch.stack([torch.roll(mother_preds, shifts=s, dims=0) for s in range(4)], dim=1)
-                    
-                    # 2. 物理图块拼接 (CAM Splicemix)
-                    X_syn, Y_syn, source_grid = self.cam_mixer(img_n, tgt_n, mask_n)
+                    # 2. 物理图块拼接 (CAM Splicemix - V3)
+                    X_syn, Y_syn, source_grid = self.cam_mixer(
+                        img_n, tgt_n, mask_n,
+                        clean_imgs, clean_tgts, clean_masks_data
+                    )
                     
                     # 3. 动态计算 Loss
                     with autocast(enabled=not self.args.disable_amp):
                         if self.args.model == 'SpliceMix_CL':
-                            # 【SpliceMix-CL 分支】：走新轨道，要求网络输出各个 patch 的预测
-                            outputs_n_overall, preds_patches = self.model(X_syn, args={'return_patches': True})
-                            
-                            loss_noisy_base = self.loss_fn(outputs_n_overall, Y_syn)
-                            loss_noisy_cam = self.criterion_cam(preds_patches, soft_targets_pools, source_grid)
-                            
-                            # 灵魂双重 Loss
-                            loss_noisy = loss_noisy_base + loss_noisy_cam
+                            # 【SpliceMix-CL 分支】
+                            outputs_n_overall = self.model(X_syn)
                             out_n_flat = outputs_n_overall[0] if isinstance(outputs_n_overall, tuple) else outputs_n_overall
+                            
+                            # ✨ 【Loss 1】基础Loss：拼接后图像与拼接后标签
+                            loss_noisy_base = self.loss_fn(outputs_n_overall, Y_syn)
+                            
+                            # ✨ 【Loss 2】一致性学习Loss：拼接后预测与原始预测在干净标签上的一致性
+                            loss_consistency = _compute_consistency_loss(
+                                outputs_origin_n,      # 原始图像预测
+                                out_n_flat,            # 拼接后图像预测
+                                tgt_n                  # 原始干净标签（掩码）
+                            )
+                            
+                            # 【双重 Loss】
+                            loss_noisy = loss_noisy_base + loss_consistency
                         else:
-                            # 【普通 SpliceMix 分支】：只计算 Base Loss
+                            # 【普通 SpliceMix 分支】：只计算基础 Loss
                             outputs_n_overall = self.model(X_syn)
                             out_n_flat = outputs_n_overall[0] if isinstance(outputs_n_overall, tuple) else outputs_n_overall
                             loss_noisy_base = self.loss_fn(outputs_n_overall, Y_syn)
                             loss_noisy = loss_noisy_base
-
+                    
                     # 4. 梯度加权聚合与输出追踪
                     weight_n = noisy_mask.sum().float() / inputs.size(0)
                     total_loss += loss_noisy * weight_n
                     
                     outputs_all[noisy_mask] = out_n_flat.data
-
+                
                 # =========================================================
                 # 梯度的统一反向传播与状态更新
                 # =========================================================
@@ -217,6 +268,7 @@ class Engine(object):
         
         # ================= 【新增】：以字典安全 get 方式提取双轨标志 =================
         # 这样即使您之后更换验证集或其他没有传这两个字段的 Dataset，也不会报错
+        #data.get('is_clean', torch.ones(inputs.size(0), dtype=torch.bool))   data中有key为'is_clean'则返回对应的值，否则返回全 True 的布尔张量（默认全是干净样本）
         is_clean = data.get('is_clean', torch.ones(inputs.size(0), dtype=torch.bool)).to(self.rank)
         cam_masks = data.get('cam_mask', torch.ones((inputs.size(0), 2, 2), dtype=torch.bool)).to(self.rank)
         # ============================================================================

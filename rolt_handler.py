@@ -200,7 +200,7 @@ class RoLT_Handler(object):
         
         # 存储上一轮的 clean mask 以便 momentum 更新 (可选，此处暂未实现以保持简单)
         self.prob_history = torch.zeros(len(train_loader.dataset)).to(self.device)
-    def step(self, epoch):
+    def step_knn(self, epoch):
         print(f"\n==> [RoLT] Epoch {epoch}: Starting Logic Flow...")
         
         # 1. 提取完整特征 (注意：这里必须是你之前修改过的、没有 mask 归零的特征！)
@@ -297,10 +297,34 @@ class RoLT_Handler(object):
         # 为“噪声样本”生成用于校正的软标签
         # 返回: {sample_index: soft_targets(Tensor)}
         soft_label_dict = self.generate_soft_labels(all_feats, all_logits, all_targets, all_indices, clean_mask_dict, label_clean_matrix)       
-        print(f"==> [RoLT] Epoch {epoch}: Logic Flow Finished.\n")
+        # ================== 核心修复 (基于 Stage 2 物理拼接特性的极简版) ==================
+        # 7. 生成专门给 Stage 2 物理拼接使用的“绝对干净硬标签字典”
+        noise_clean_labels_dict = {}
         
-        return clean_mask_dict, soft_label_dict
-    def step_loss(self, epoch):
+        is_sample_trustworthy = torch.tensor(
+            [clean_mask_dict[idx.item()] for idx in all_indices]
+        ).bool().to(self.device)
+        noisy_indices_loc = torch.where(~is_sample_trustworthy)[0]
+        
+        if len(noisy_indices_loc) > 0:
+            noisy_targets = all_targets[noisy_indices_loc]
+            fine_grained_clean_mask = label_clean_matrix[noisy_indices_loc]
+            
+            # 拷贝一份原始硬标签 (0 或 1)
+            hard_corrected_targets = noisy_targets.clone().float()
+            
+            # 【铁腕清理】：只要原始是 1，且 KNN 说是噪声（False），强制拉低到 0.0！
+            # 【废弃假阴性恢复】：完全不处理原本为 0 的标签，因为 Stage 2 物理拼接不需要（也不能用）疑似病灶。
+            hard_corrected_targets[(noisy_targets == 1) & (~fine_grained_clean_mask)] = 0.0
+            
+            noisy_real_indices = all_indices[noisy_indices_loc]
+            for idx, h_label in zip(noisy_real_indices, hard_corrected_targets):
+                noise_clean_labels_dict[idx.item()] = h_label.detach().cpu()
+        # ===============================================
+        print(f"==> [RoLT] Epoch {epoch}: Logic Flow Finished.\n")
+        # 返回 3 个参数，完美匹配 stage1_main.py 的解包
+        return clean_mask_dict, soft_label_dict, noise_clean_labels_dict
+    def step(self, epoch):
         print(f"\n==> [RoLT] Epoch {epoch}: Starting Logic Flow (Small-Loss Criterion)...")
         
         # 1. 冻结模型 & 提取特征与 Logits
@@ -331,8 +355,33 @@ class RoLT_Handler(object):
         # 6. 生成软伪标签
         soft_label_dict = self.generate_soft_labels(all_feats, all_logits, all_targets, all_indices, clean_mask_dict, label_clean_matrix)        
         
+        # ================== 核心修复 (基于 Stage 2 物理拼接特性的极简版) ==================
+        # 7. 生成专门给 Stage 2 物理拼接使用的“绝对干净硬标签字典”
+        noise_clean_labels_dict = {}
+        
+        is_sample_trustworthy = torch.tensor(
+            [clean_mask_dict[idx.item()] for idx in all_indices]
+        ).bool().to(self.device)
+        noisy_indices_loc = torch.where(~is_sample_trustworthy)[0]
+        
+        if len(noisy_indices_loc) > 0:
+            noisy_targets = all_targets[noisy_indices_loc]
+            fine_grained_clean_mask = label_clean_matrix[noisy_indices_loc]
+            
+            # 拷贝一份原始硬标签 (0 或 1)
+            hard_corrected_targets = noisy_targets.clone().float()
+            
+            # 【铁腕清理】：只要原始是 1，且 KNN 说是噪声（False），强制拉低到 0.0！
+            # 【废弃假阴性恢复】：完全不处理原本为 0 的标签，因为 Stage 2 物理拼接不需要（也不能用）疑似病灶。
+            hard_corrected_targets[(noisy_targets == 1) & (~fine_grained_clean_mask)] = 0.0
+            
+            noisy_real_indices = all_indices[noisy_indices_loc]
+            for idx, h_label in zip(noisy_real_indices, hard_corrected_targets):
+                noise_clean_labels_dict[idx.item()] = h_label.detach().cpu()
+        # ===============================================
         print(f"==> [RoLT] Epoch {epoch}: Logic Flow Finished.\n")
-        return clean_mask_dict, soft_label_dict
+        # 返回 3 个参数，完美匹配 stage1_main.py 的解包
+        return clean_mask_dict, soft_label_dict, noise_clean_labels_dict
     def extract_features_and_mask(self):
         """
         遍历数据集，提取特征，并根据 Target 进行 Masking
