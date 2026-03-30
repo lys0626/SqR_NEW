@@ -13,7 +13,38 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.manifold import TSNE
 
-
+def plot_loss_gmm_fit(log_losses, gmm, class_idx, epoch, save_dir="./gmm_loss_plots"):
+    """
+    可视化基于 Log-Loss 的 1D GMM 拟合效果
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    plt.figure(figsize=(8, 5))
+        
+    # 1. 绘制经验 Loss 的直方图
+    plt.hist(log_losses, bins=50, density=True, alpha=0.5, color='gray', label='Empirical Log-Loss')
+        
+    x = np.linspace(log_losses.min(), log_losses.max(), 1000).reshape(-1, 1)
+        
+    weights = gmm.weights_
+    means = gmm.means_
+    covars = gmm.covariances_
+    
+    pdf0 = weights[0] * norm.pdf(x, means[0, 0], np.sqrt(covars[0, 0, 0]))
+    pdf1 = weights[1] * norm.pdf(x, means[1, 0], np.sqrt(covars[1, 0, 0]))
+    
+    # 均值小的在左边，代表 Loss 小（干净样本）
+    plt.plot(x, pdf0, color='blue', linewidth=2, label=f'Comp 0 (Mean={means[0,0]:.2f})')
+    plt.plot(x, pdf1, color='red', linewidth=2, label=f'Comp 1 (Mean={means[1,0]:.2f})')
+    plt.plot(x, pdf0 + pdf1, color='black', linestyle='--', linewidth=2, label='GMM Sum')
+        
+    plt.title(f'Log-Loss GMM Fit for Class {class_idx} at Epoch {epoch}')
+    plt.xlabel('Log(BCE Loss)')
+    plt.ylabel('Density')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+        
+    plt.savefig(os.path.join(save_dir, f'gmm_loss_ep{epoch}_cls{class_idx}.png'), dpi=150)
+    plt.close()
 def plot_feature_tsne(feats, targets, class_idx, epoch, class_names=None, save_dir="./diagnostics"):
     """
     [诊断工具 1 - 改进版] 用 t-SNE 可视化特定类别的正负样本特征分布，直接标注真实类别名称
@@ -266,7 +297,7 @@ class RoLT_Handler(object):
         print(f"==> [RoLT] Epoch {epoch}: Logic Flow Finished.\n")
         # 返回 3 个参数，完美匹配 stage1_main.py 的解包
         return clean_mask_dict, soft_label_dict, noise_clean_labels_dict
-    def step(self, epoch):
+    def step_center(self, epoch):
         """
         每个 Epoch 开始时调用。
         执行：特征提取 -> Masking -> 原型计算 -> GMM 清洗 -> 样本筛选 -> 软标签生成
@@ -324,7 +355,7 @@ class RoLT_Handler(object):
         print(f"==> [RoLT] Epoch {epoch}: Logic Flow Finished.\n")
         # 返回 3 个参数，完美匹配 stage1_main.py 的解包
         return clean_mask_dict, soft_label_dict, noise_clean_labels_dict
-    def step_loss(self, epoch):
+    def step(self, epoch):
         print(f"\n==> [RoLT] Epoch {epoch}: Starting Logic Flow (Small-Loss Criterion)...")
         
         # 1. 冻结模型 & 提取特征与 Logits
@@ -344,7 +375,7 @@ class RoLT_Handler(object):
         # ==========================================================
         
         # 3. GMM 清洗 (传入 all_losses 代替 all_feats)
-        label_clean_matrix = self.gmm_cleaning_loss(all_losses, all_targets)
+        label_clean_matrix = self.gmm_cleaning_loss(all_losses, all_targets,epoch)
         
         # 4. 样本级筛选
         clean_mask_dict = self.apply_sample_selection_rule(label_clean_matrix, all_targets, all_indices)
@@ -593,14 +624,20 @@ class RoLT_Handler(object):
                 label_clean_matrix[pos_indices, c] = True
                 
         return label_clean_matrix
-    def gmm_cleaning_loss(self, losses, targets):
+    def gmm_cleaning_loss(self, losses, targets, epoch):
         """
-        基于 Small-Loss Criterion 的 GMM 清洗
+        [增强版] 基于 Small-Loss Criterion 与对数变换的 Per-Class GMM 清洗
         """
-        print("[RoLT] Running GMM Cleaning per class (using Small-Loss Criterion)...")
-        # 初始化全为 False (Noisy)
+        print(f"[RoLT] Running ENHANCED GMM Cleaning per class (Log-Transform + Clipping)...")
         label_clean_matrix = torch.zeros_like(targets, dtype=torch.bool).to(self.device)
         
+        # 准备可视化路径
+        try:
+            base_out_dir = self.args.output 
+        except AttributeError:
+            base_out_dir = "./experiment/robust_run"
+        vis_dir = os.path.join(base_out_dir, "gmm_loss_visualizations")
+
         for c in range(self.num_classes):
             pos_indices = (targets[:, c] == 1)
             num_samples = pos_indices.sum().item()
@@ -610,36 +647,45 @@ class RoLT_Handler(object):
                 label_clean_matrix[pos_indices, c] = True
                 continue
                 
-            # 获取该类别正样本的 Loss 值，作为 GMM 的一维输入
-            class_losses = losses[pos_indices, c]
+            class_losses = losses[pos_indices, c].detach().cpu().numpy()
             
-            # 将 Loss 转换为 GMM 要求的 numpy 格式
-            dists = class_losses.detach().cpu().numpy().reshape(-1, 1)
+            # ================= 核心优化：Log 变换与截断 =================
+            # 1. 加上极小值防止 log(0)，取对数将单边长尾转为双峰高斯
+            log_losses = np.log(class_losses + 1e-8)
             
-            # GMM 拟合 (2 components)
+            # 2. 截断极端的 1% Outlier，防止 GMM 的方差被拉爆
+            p1, p99 = np.percentile(log_losses, 1), np.percentile(log_losses, 99)
+            clipped_log_losses = np.clip(log_losses, p1, p99).reshape(-1, 1)
+            # ==========================================================
+            
             try:
-                gmm = GaussianMixture(n_components=2, max_iter=10, tol=1e-2, reg_covar=5e-4, random_state=self.args.seed)
-                gmm.fit(dists)
+                # 增加 max_iter, 降低 tol，防止由于医学数据重叠大导致的不收敛
+                gmm = GaussianMixture(n_components=2, max_iter=50, tol=1e-3, reg_covar=1e-3, random_state=self.args.seed)
+                gmm.fit(clipped_log_losses)
                 
-                # 均值较小的 Gaussian 分布对应 Clean (Loss 越小越干净)
+                # 均值较小的分布对应 Clean (Loss 越小越干净)
                 clean_comp_idx = gmm.means_.argmin()
                 
-                # 获取每个样本属于 Clean 分布的概率 post_prob
-                probs = gmm.predict_proba(dists)
+                # 获取每个样本属于 Clean 分布的后验概率
+                probs = gmm.predict_proba(clipped_log_losses)
                 prob_clean = probs[:, clean_comp_idx]
                 
                 # 设定阈值 0.5 判定是否 Clean
                 is_clean_subset = (prob_clean > 0.5)
                 
-                # 填回大矩阵
                 full_indices = torch.where(pos_indices)[0]
                 clean_indices = full_indices[is_clean_subset]
                 label_clean_matrix[clean_indices, c] = True
                 
+                # --- 动态可视化 ---
+                target_epoch = getattr(self.args, 'splicemix_start_epoch', 10)
+                if epoch == target_epoch or epoch == target_epoch - 1:
+                    plot_loss_gmm_fit(clipped_log_losses, gmm, class_idx=c, epoch=epoch, save_dir=vis_dir)
+                    
             except Exception as e:
-                # GMM 失败的保守策略
                 print(f"Warning: GMM failed for class {c}, setting all to clean. Error: {e}")
                 label_clean_matrix[pos_indices, c] = True
+                
         return label_clean_matrix
     def apply_sample_selection_rule(self, label_clean_matrix, targets, indices):
         """

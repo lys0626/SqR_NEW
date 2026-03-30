@@ -10,38 +10,38 @@ from models_s2.SpliceMix_CL import Loss_fn
 from models_s2.cam_splicemix import CAMSpliceMixer_MixedLabel
 from models_s2.loss_fns import Loss_fn_CAM
 # =======================================================
+import torch.nn.functional as F
+
 def _compute_consistency_loss(outputs_origin, outputs_syn, tgt_mask, weight=1.0):
-                    """
-                    【一致性学习Loss】
-                    
-                    在干净标签位置上，拼接后的预测应该与原始预测保持一致
-                    
-                    Args:
-                        outputs_origin: (B_n, num_classes) - 原始图像的预测
-                        outputs_syn: (B_n, num_classes) - 拼接后图像的预测
-                        tgt_mask: (B_n, num_classes) - 干净标签掩码（0/1）
-                        weight: 一致性损失权重
-                    
-                    Returns:
-                        consistency_loss: 标量损失
-                    """
-                    import torch.nn.functional as F
-                    
-                    # ✨ 只在��净标签位置计算一致性
-                    # 对于每个样本，在 tgt_mask=1 的位置上，
-                    # 拼接后的预测应该接近原始预测
-                    
-                    # 方案：MSE 损失
-                    diff = outputs_syn - outputs_origin  # [B_n, num_classes]
-                    squared_diff = diff ** 2             # [B_n, num_classes]
-                    
-                    # 应用掩码：只在干净标签位置计算
-                    masked_diff = squared_diff * tgt_mask  # [B_n, num_classes]
-                    
-                    # 求平均
-                    loss_consistency = masked_diff.sum() / (tgt_mask.sum() + 1e-8)
-                    
-                    return loss_consistency * weight
+    """
+    【一致性学习Loss】(BCE 软标签蒸馏版)
+    
+    在干净标签位置上，拼接后的预测概率分布应该与原始预测保持一致
+    
+    Args:
+        outputs_origin: (B_n, num_classes) - 原始图像的预测 (Logits)
+        outputs_syn: (B_n, num_classes) - 拼接后图像的预测 (Logits)
+        tgt_mask: (B_n, num_classes) - 干净标签掩码（0/1）
+        weight: 一致性损失权重
+    """
+    # 1. 将原始图像的 Logits 转换为概率，并作为固定的软标签 (切断梯度)
+    soft_targets = torch.sigmoid(outputs_origin).detach()
+    
+    # 2. 计算拼接后预测与软标签之间的 BCE Loss
+    # 注意：必须使用 reduction='none' 以便后续应用掩码
+    bce_loss_matrix = F.binary_cross_entropy_with_logits(
+        outputs_syn, 
+        soft_targets, 
+        reduction='none'
+    )
+    
+    # 3. 应用掩码：只在干净标签 (tgt_mask == 1) 的位置计算一致性
+    masked_bce = bce_loss_matrix * tgt_mask
+    
+    # 4. 求有效位置的平均 Loss
+    loss_consistency = masked_bce.sum() / (tgt_mask.sum() + 1e-8)
+    
+    return loss_consistency * weight
 class Engine(object):
     def __init__(self, args):
         super(Engine, self).__init__()
