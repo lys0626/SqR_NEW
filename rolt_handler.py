@@ -266,7 +266,7 @@ class RoLT_Handler(object):
         print(f"==> [RoLT] Epoch {epoch}: Logic Flow Finished.\n")
         # 返回 3 个参数，完美匹配 stage1_main.py 的解包
         return clean_mask_dict, soft_label_dict, noise_clean_labels_dict
-    def step_center(self, epoch):
+    def step(self, epoch):
         """
         每个 Epoch 开始时调用。
         执行：特征提取 -> Masking -> 原型计算 -> GMM 清洗 -> 样本筛选 -> 软标签生成
@@ -324,7 +324,7 @@ class RoLT_Handler(object):
         print(f"==> [RoLT] Epoch {epoch}: Logic Flow Finished.\n")
         # 返回 3 个参数，完美匹配 stage1_main.py 的解包
         return clean_mask_dict, soft_label_dict, noise_clean_labels_dict
-    def step(self, epoch):
+    def step_loss(self, epoch):
         print(f"\n==> [RoLT] Epoch {epoch}: Starting Logic Flow (Small-Loss Criterion)...")
         
         # 1. 冻结模型 & 提取特征与 Logits

@@ -327,36 +327,41 @@ class Engine(object):
         str_metrics = ""
         if not is_train and 'mAUC' in metrics_res:
             str_metrics = (
-                f"mAUC: {metrics_res['mAUC']:.4f}, "
+                # [修改]：在全局指标中加入 meanACC
+                f"mAUC: {metrics_res['mAUC']:.4f}, meanACC: {metrics_res.get('mean_ACC', 0.0):.4f}, "
                 f"miF1: {metrics_res['micro_F1']:.4f}, maF1: {metrics_res['macro_F1']:.4f}, "
                 f"miP: {metrics_res['micro_P']:.4f}, maP: {metrics_res['macro_P']:.4f}, "
                 f"miR: {metrics_res['micro_R']:.4f}, maR: {metrics_res['macro_R']:.4f}"
             )
-            # --- 新增：提取并打印每个具体疾病类别的 AUROC ---
+            # --- [修改]：提取并打印每个具体疾病类别的 AUROC 和 ACC ---
             if 'auc_list' in metrics_res:
                 auc_list = metrics_res['auc_list']
+                class_acc_list = metrics_res.get('class_ACC', []) # 获取刚才算出来的各类别 ACC
+                
                 # 从 dataset 中获取疾病名称列表，做好容错处理
                 if hasattr(self.dataset['test'], 'classes'):
                     class_names = self.dataset['test'].classes
                 else:
                     class_names = [f"Class_{i}" for i in range(len(auc_list))]
                 
-                # 将疾病名称与对应的 AUC 拼接成字符串
+                # 将疾病名称与对应的 AUC、ACC 拼接成字符串
                 per_class_str = ", ".join([
-                    f"{name}: {auc:.4f}" if auc != -1.0 else f"{name}: N/A" 
-                    for name, auc in zip(class_names, auc_list)
+                    f"{name}: (AUC:{auc:.4f} | ACC:{acc:.4f})" if auc != -1.0 else f"{name}: (AUC:N/A | ACC:{acc:.4f})" 
+                    for name, auc, acc in zip(class_names, auc_list, class_acc_list)
                 ])
-                # 打印详细的 Per-Class AUC
-                self.logger.info(f"[Per-Class AUC] {per_class_str}")
+                # 打印详细的 Per-Class 指标
+                self.logger.info(f"[Per-Class Metrics] {per_class_str}")
 
+        # ==================== 【关键修复：补回你漏掉的原始日志打印和 Best Model 判定】 ====================
         if is_train:
             str_log = f'[Epoch {self.epoch}, lr{self.lr_curr}] [Train] time:{utils.strftime(self.epoch_time)}s, loss: {loss:.4f} .'
             self.logger.info(str_log)
         else:
+            # 打印包含 meanACC 的全局日志
             str_log = f'[Test] time: {utils.strftime(self.epoch_time)}s, loss: {loss:.4f}, {str_metrics} .'
             self.logger.info(str_log)
 
-            # Best Model 判定
+            # Best Model 判定 (必须要有这段，否则没法保存最佳权重)
             current_mAUC = metrics_res.get('mAUC', 0.0)
             if result_best['mAUC'] < current_mAUC:
                 is_best = True
@@ -367,6 +372,7 @@ class Engine(object):
 
             str_best = f"--[Test-best] (E{result_best['epoch']}), mAUC: {result_best['mAUC']:.4f}"
             self.logger.info(str_best)
+        # =================================================================================================
 
         if self.args.evaluate != 0 and utils_ddp.is_main_process():
             self.save_checkpoint(is_train, is_best)

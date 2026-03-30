@@ -44,7 +44,7 @@ else
     METHOD_SUFFIX="baseline"        # <--- 新增 (对应 engine.py) 
 fi
 
-WEIGHTS_PATH="/data/dsj/lys/SqR-NEW/experiment/knn_1/nih/stage2_splicemix-cl/NIH-CHEST/SpliceMix_CL/NIH-CHEST_splicemix_best.pt"
+WEIGHTS_PATH="/data/dsj/lys/SqR-NEW/experiment/loss_2/nih/stage2_splicemix-cl/NIH-CHEST/SpliceMix_CL/NIH-CHEST_splicemix_best.pt"
 echo "==================================================="
 echo "  启动测试评估模式 (Evaluate Only) "
 echo "  ==> 评估方法: ${STAGE2_METHOD}"

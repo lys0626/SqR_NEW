@@ -5,15 +5,15 @@ set -e  # 只要发生任何报错，脚本立刻停止
 GPU_ID=1
 export CUDA_VISIBLE_DEVICES=${GPU_ID}      
 
-DATASET_NAME="nih"
-DATASET_NAME_UPPER="NIH-CHEST"
-DATA_DIR="/data/nih-chest-xrays"
-# DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
-# DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
-# DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
-EXP_DIR="./experiment/knn_1"        
+# DATASET_NAME="nih"
+# DATASET_NAME_UPPER="NIH-CHEST"
+# DATA_DIR="/data/nih-chest-xrays"
+DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
+DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
+DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
+EXP_DIR="./experiment/loss_2"        
 STAGE2_METHOD="splicemix-cl"             
-NUM_CLASS=14
+NUM_CLASS=13
 
 # ================= 2. 动态生成输出目录 =================
 STAGE1_OUT="${EXP_DIR}/${DATASET_NAME}/stage1_${STAGE2_METHOD}_q2l"

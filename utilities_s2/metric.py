@@ -69,10 +69,16 @@ class AveragePrecisionMeter(object):
         # 2. 计算 P, R, F1 (Micro / Macro)
         # 阈值 0.5
         y_pred = (y_probs >= 0.5).astype(int)
-
+        # ================= [新增计算 ACC] =================
+        correct_mask = (y_pred == y_true).astype(float)
+        class_acc = np.mean(correct_mask, axis=0) # 沿样本维度求均值，得到各类别的ACC
+        mean_acc = np.mean(class_acc)             # 所有类别ACC的平均值
+        # ==================================================
         return {
             'mAUC': mAUC,
             'auc_list': auc_list, # <--- 新增: 返回每类 AUC 列表
+            'mean_ACC': mean_acc,                # <--- 新增: 返回 mean_ACC
+            'class_ACC': class_acc.tolist(),     # <--- 新增: 返回每类 ACC 列表
             'micro_P': metrics.precision_score(y_true, y_pred, average='micro', zero_division=0),
             'micro_R': metrics.recall_score(y_true, y_pred, average='micro', zero_division=0),
             'micro_F1': metrics.f1_score(y_true, y_pred, average='micro', zero_division=0),
