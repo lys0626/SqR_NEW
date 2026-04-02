@@ -12,7 +12,7 @@ from models_s2.loss_fns import Loss_fn_CAM
 # =======================================================
 import torch.nn.functional as F
 
-def _compute_consistency_loss(outputs_origin, outputs_syn, tgt_mask, weight=1.0):
+def _compute_consistency_loss(outputs_origin, outputs_syn, tgt_mask, weight=1.0, temperature=2.0):
     """
     【一致性学习Loss】(BCE 软标签蒸馏版)
     
@@ -34,7 +34,8 @@ def _compute_consistency_loss(outputs_origin, outputs_syn, tgt_mask, weight=1.0)
         soft_targets, 
         reduction='none'
     )
-    
+    # 乘以温度的平方补偿梯度缩放
+    bce_loss_matrix = bce_loss_matrix * (temperature ** 2)
     # 3. 应用掩码：只在干净标签 (tgt_mask == 1) 的位置计算一致性
     masked_bce = bce_loss_matrix * tgt_mask
     

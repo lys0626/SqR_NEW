@@ -4,7 +4,7 @@
 # ==============================================================================
 
 # ================= 1. 配置必须与训练时一致 =================
-GPU_ID=7
+GPU_ID=0
 DATASET_NAME="nih"
 DATASET_NAME_UPPER="NIH-CHEST"
 DATA_DIR="/data/nih-chest-xrays"
@@ -44,7 +44,7 @@ else
     METHOD_SUFFIX="baseline"        # <--- 新增 (对应 engine.py) 
 fi
 
-WEIGHTS_PATH="/data/dsj/lys/SqR-NEW/experiment/loss_2/nih/stage2_splicemix-cl/NIH-CHEST/SpliceMix_CL/NIH-CHEST_splicemix_best.pt"
+WEIGHTS_PATH="/data/dsj/lys/SqR-old_3_25/experiment/3.31/nih/stage2_splicemix-cl/NIH-CHEST/SpliceMix_CL/NIH-CHEST_splicemix_best.pt"
 echo "==================================================="
 echo "  启动测试评估模式 (Evaluate Only) "
 echo "  ==> 评估方法: ${STAGE2_METHOD}"
@@ -57,7 +57,7 @@ python stage2_main.py \
   --data-root "${DATA_DIR}" \
   --model "${MODEL_ARG}" \
   -mixer "${MIXER_ARG}" \
-  --batch-size 128 \
+  --batch-size 256 \
   -e 0 \
   -r "${WEIGHTS_PATH}" \
   -cd ${GPU_ID}
