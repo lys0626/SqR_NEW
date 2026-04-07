@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.optim import lr_scheduler
 import torch.backends.cudnn as cudnn
 import torch.utils.data
-
+import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 
 from lib.dataset.get_dataset import get_datasets
@@ -129,11 +129,11 @@ def main_worker(args, logger):
     model = build_q2l(args).cuda()
     ema_m = ModelEma(model, args.ema_decay) 
 
-    criterion = AsymmetricLossOptimized(
-        gamma_neg=args.gamma_neg, gamma_pos=args.gamma_pos, 
-        clip=args.loss_clip, disable_torch_grad_focal_loss=args.dtgfl
-    )
-
+    # criterion = AsymmetricLossOptimized(
+    #     gamma_neg=args.gamma_neg, gamma_pos=args.gamma_pos, 
+    #     clip=args.loss_clip, disable_torch_grad_focal_loss=args.dtgfl
+    # )
+    criterion = nn.CrossEntropyLoss()
     base_lr = args.lr
     backbone_params, other_params = [], []
     for name, param in model.named_parameters():
@@ -143,7 +143,8 @@ def main_worker(args, logger):
         else:
             other_params.append(param)
             
-    param_dicts = [{"params": backbone_params, "lr": base_lr*0.1}, {"params": other_params, "lr": base_lr}]
+    # param_dicts = [{"params": backbone_params, "lr": base_lr*0.1}, {"params": other_params, "lr": base_lr}]
+    param_dicts = [{"params": backbone_params, "lr": base_lr}, {"params": other_params, "lr": base_lr}]
     optimizer = torch.optim.SGD(param_dicts, lr=base_lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
 
     train_dataset, val_dataset = get_datasets(args)

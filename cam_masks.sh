@@ -2,7 +2,7 @@
 set -e  # 只要发生任何报错，脚本立刻停止
 
 # ================= 1. 基础全局配置 =================
-GPU_ID=1
+GPU_ID=2
 export CUDA_VISIBLE_DEVICES=${GPU_ID}      
 
 # DATASET_NAME="nih"
@@ -11,7 +11,7 @@ export CUDA_VISIBLE_DEVICES=${GPU_ID}
 DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
 DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
 DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
-EXP_DIR="./experiment/loss_2"        
+EXP_DIR="./experiment/new_stage1"        
 STAGE2_METHOD="splicemix-cl"             
 NUM_CLASS=13
 
