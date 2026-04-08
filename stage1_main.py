@@ -86,7 +86,18 @@ def parser_args():
     # 单卡设备
     parser.add_argument('-cd', '--cuda_devices', default=[0], nargs='+', type=int)
     parser.add_argument('--orid_norm', action='store_true', default=False)
+
+    # Phase 控制参数
+    parser.add_argument("--i_rate_1", type=int, default=3)
+    parser.add_argument("--i_rate_2", type=int, default=3)
+    parser.add_argument("--i_rate_3", type=int, default=3)
+    parser.add_argument("--i_rate_4", type=int, default=0)
     
+    # 动态保留比例 (注意：在 MEE 中 remove_rate 其实是 "保留的干净样本比例")
+    parser.add_argument("--remove_rate_1", type=float, default=0.995)
+    parser.add_argument("--remove_rate_2", type=float, default=0.995)
+    parser.add_argument("--remove_rate_3", type=float, default=0.995)
+    parser.add_argument("--remove_rate_4", type=float, default=0.995)
     args = parser.parse_args()
     return args
 
@@ -219,7 +230,7 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
     
     num_samples = len(dataset)
     num_classes = args.num_class
-    
+    mee_noisy_mask = torch.zeros_like(fkl_mask)
     loss_tensor = torch.zeros((num_samples, num_classes), dtype=torch.float32).to(device)
     conf_tensor = torch.zeros((num_samples, num_classes), dtype=torch.float32).to(device)
     grad_tensor = torch.zeros((num_samples, num_classes), dtype=torch.float32).to(device)
@@ -252,7 +263,7 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
     fkl_indices = torch.nonzero(fkl_mask) 
     M = len(fkl_indices)
     logger.info(f"    -> Found {M} FkL label candidates out of {num_samples * num_classes} total labels.")
-    
+
     if M > 0:
         fkl_losses = loss_tensor[fkl_mask]
         fkl_confs = conf_tensor[fkl_mask]
@@ -280,9 +291,14 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
             
             if mee_count > 0:
                 mee_global_indices = fkl_indices[mee_local_idx]
-                fkl_mask[mee_global_indices[:, 0], mee_global_indices[:, 1]] = False
+                # 【旧代码】：直接在 fkl_mask 上把候选置为 False
+                # fkl_mask[mee_global_indices[:, 0], mee_global_indices[:, 1]] = False
                 
-    return fkl_mask 
+                # 【新代码】：我们不动 fkl_mask，而是把确凿的噪声记录在 mee_noisy_mask 里
+                mee_noisy_mask[mee_global_indices[:, 0], mee_global_indices[:, 1]] = True
+                
+    # 【修改返回值】：同时返回原始的 fkl_mask 和找出的 噪声 mask
+    return fkl_mask, mee_noisy_mask
 def pick_remove_rate_by_phase(rn, i1, i2, i3, r1, r2, r3, r4):
     """根据当前的 Round 轮次，匹配对应的 remove_rate"""
     if rn <= i1:
@@ -292,6 +308,16 @@ def pick_remove_rate_by_phase(rn, i1, i2, i3, r1, r2, r3, r4):
     if rn <= i1 + i2 + i3:
         return r3
     return r4
+def get_fkl_required_epochs(rn, i1, i2, i3):
+    """根据 MEE 原版逻辑，通过 i_rate 确定当前所处的 Phase，返回需要连续预测正确的次数"""
+    if rn <= i1:
+        return 1
+    elif rn <= i1 + i2:
+        return 2
+    elif rn <= i1 + i2 + i3:
+        return 3
+    else:
+        return 4
 def main():
     args = parser_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.cuda_devices[0])
@@ -321,27 +347,24 @@ def main():
     for _, targets, indices in etrain_loader:
         all_targets[indices] = (targets == 1).to(device)
 
-    # 标签级 FkL 矩阵初始化
+    # 标签级FkL矩阵初始化
     fkl_consecutive_counts = torch.zeros((num_train_samples, args.num_class), dtype=torch.int32).to(device)
     fkl_mask = torch.zeros((num_train_samples, args.num_class), dtype=torch.bool).to(device)
 
-    logger.info("=================== Stage 1 Training Start ===================")
     # === 初始化全局掩码 ===
     # 初始状态下，所有标签都视为“干净”（参与训练）
+
     global_label_mask = torch.ones((num_train_samples, args.num_class), dtype=torch.bool).to(device)
     num_rounds = getattr(args, 'num_rounds', 3) 
-    fkl_threshold = getattr(args, 'fkl_threshold', args.newremove_rate)
+    num_rounds = args.i_rate_1 + args.i_rate_2 + args.i_rate_3 + args.i_rate_4
     logger.info(f"=================== Stage 1 Training Start (Multi-Round Mode: {num_rounds} Rounds) ===================")
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, drop_last=True)
+    
     # ================= 修改三：真正激活 Multi-Round 逻辑 =================
     for round_num in range(1, num_rounds + 1):
         logger.info(f"\n" + "="*20 + f" Starting Round {round_num}/{num_rounds} " + "="*20)
-        
-        # 可选：根据当前 Round 动态调整本轮的 remove_rate
-        # args.newremove_rate = pick_remove_rate_by_phase(round_num, 1, 1, 1, 20000, 40000, 60000, 80000)
-        
+
         # ================= 关键修改：每轮重新初始化网络与优化器 =================
-        # 确保模型不受上一轮脏数据梯度的影响 (Cold Start)
         net1 = build_q2l(args).to(device)
         net2 = build_q2l(args).to(device)
         ema1 = ModelEMA(net1, alpha=0.999)
@@ -349,7 +372,8 @@ def main():
         models = (net1, net2, ema1.ema_model, ema2.ema_model)
 
         opt1, opt2 = build_dual_optimizers(net1, net2, args)
-        
+        sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=args.epochs, eta_min=1e-5)
+        sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=args.epochs, eta_min=1e-5)
         # ================= 关键修改：每轮重置 FkL 统计矩阵 =================
         # 因为网络重置了，连续正确预测的次数也必须重新从 0 开始计算
         fkl_consecutive_counts = torch.zeros((num_train_samples, args.num_class), dtype=torch.int32).to(device)
@@ -359,35 +383,59 @@ def main():
             
             # 1. 训练一个 Epoch (现在正确传入了 global_label_mask)
             train_one_epoch_mutual_kd(net1, net2, ema1.ema_model, ema2.ema_model, ema1, ema2, opt1, opt2, train_loader, criterion, args, device, global_label_mask)
-            
+            sch1.step()
+            sch2.step()
             # 2. 追踪标签级 FkL
             if epoch >= args.warm_up_epochs:
                 logger.info("    -> Tracking LABEL-LEVEL predictions for FkL...")
-                update_fkl_mask(models, etrain_loader, device, fkl_consecutive_counts, fkl_mask, args.fkl_consecutive_epochs)
                 
-                # 统计当前满足连续预测正确的 FkL 候选数量
-                current_fkl_count = fkl_mask.sum().item()
-                logger.info(f"    -> Current FkL Candidates: {current_fkl_count} (Threshold: {fkl_threshold})")
+                # ========== 【核心修正：严格对齐 MEE 的 Phase 逻辑】 ==========
+                # 根据当前 round_num 和 i_rate 划分，算出真实的 FkL 连续要求次数
+                current_required_epochs = get_fkl_required_epochs(round_num, args.i_rate_1, args.i_rate_2, args.i_rate_3)
+                current_required_epochs = min(current_required_epochs, args.fkl_consecutive_epochs)
                 
-                # === 核心逻辑：判断是否达到截断条件 ===
-                # 如果候选数量达标，或者达到了当前 Round 设置的强行退出 Epoch
-                if current_fkl_count >= fkl_threshold or epoch == args.splicemix_start_epoch:
-                    logger.info(f"\n>>> Condition Met! Executing Label-Level Early Cutting for Round {round_num}... <<<")
-                    
-                    # 【阶段A】剔除高Loss、高置信度、低梯度的 MEE 噪声标签，返回更新后的掩码
-                    clean_label_mask = perform_label_level_early_cutting(models, train_dataset_eval, fkl_mask, args, logger, device)
-                    
-                    # 更新全局掩码，供下一轮（或者后面的投票）使用
-                    global_label_mask = clean_label_mask
-                    
+                logger.info(f"    -> Current Round {round_num} is in Phase {current_required_epochs}, requires {current_required_epochs} consecutive correct predictions.")
+                
+                update_fkl_mask(models, etrain_loader, device, fkl_consecutive_counts, fkl_mask, current_required_epochs)
+                # ========== 【核心修正：严格基于“有标注的正标签”计算进度】 ==========
+                # 你的 all_targets 矩阵完美记录了所有 Target == 1 的位置
+                
+                # 1. 统计当前满足连续预测正确的候选者中，属于“真正疾病(正标签)”的数量
+                current_fkl_count = (fkl_mask & all_targets).sum().item()
+                
+                # 2. 获取本阶段的保留比例
+                current_remove_rate = pick_remove_rate_by_phase(
+                    round_num,
+                    args.i_rate_1, args.i_rate_2, args.i_rate_3,
+                    args.remove_rate_1, args.remove_rate_2, args.remove_rate_3, args.remove_rate_4
+                )
+                
+                # 3. 获取当前池子里，依然存活的“真正疾病(正标签)”总数
+                current_pool_size = (global_label_mask & all_targets).sum().item()
+                
+                # 4. 动态算出基于正样本的及格线
+                dynamic_threshold = int(current_pool_size * current_remove_rate)
+                # ====================================================================
+                
+                logger.info(f"    -> Current FkL Candidates: {current_fkl_count} (Dynamic Threshold: {dynamic_threshold})")
+                
+                # === 核心逻辑：使用动态及格线判断是否达到截断条件 ===
+                if current_fkl_count >= dynamic_threshold or epoch == args.epochs - 1:
+                    if round_num == 1:
+                        logger.info(f"\n>>> [Round 1] Executing Label-Level Early Cutting (Blacklist Mode)... <<<")
+                        fkl_mask, mee_noisy_mask = perform_label_level_early_cutting(models, train_dataset_eval, fkl_mask, args, logger, device)
+                        global_label_mask = global_label_mask & (~mee_noisy_mask)
+                    else:
+                        logger.info(f"\n>>> [Round {round_num}] Using pure FkL filtering (Whitelist Mode)... <<<")
+                        global_label_mask = global_label_mask & fkl_mask    
                     # 判断是否是最后一轮
                     if round_num == num_rounds:
                         logger.info(f"\n>>> Final Round {round_num} Reached. Executing Sample-Level Voting & Exiting! <<<")
                         
                         # 【阶段B】样本级聚合投票 (核心: clean_pos > noisy_pos)
                         total_positives = all_targets.sum(dim=1) 
-                        clean_pos_counts = (clean_label_mask & all_targets).sum(dim=1)
-                        noisy_pos_counts = (~clean_label_mask & all_targets).sum(dim=1)
+                        clean_pos_counts = (global_label_mask & all_targets).sum(dim=1)
+                        noisy_pos_counts = (~global_label_mask & all_targets).sum(dim=1)
                         
                         is_clean_sample = torch.zeros(num_train_samples, dtype=torch.bool).to(device)
                         
@@ -405,7 +453,7 @@ def main():
                         # 生成噪声样本的干净标签字典，供 Stage 2 CAM 使用
                         noise_clean_labels_dict = {}
                         for n_idx in noisy_indices:
-                            clean_lbls = torch.nonzero(clean_label_mask[n_idx]).squeeze(1).tolist()
+                            clean_lbls = torch.nonzero(global_label_mask[n_idx]).squeeze(1).tolist()
                             noise_clean_labels_dict[int(n_idx)] = clean_lbls
 
                         # 保存并退出
