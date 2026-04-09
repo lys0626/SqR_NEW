@@ -49,7 +49,7 @@ class nihchest(Dataset):
         labels_np = self.df[self.label_names].values.astype(np.float32)
         
         # 指定图片文件夹路径
-        img_folder = os.path.join(self.root, 'img_512')
+        img_folder = os.path.join(self.root, 'img_224')
         if not os.path.exists(img_folder):
             print(f"Warning: Image folder not found at {img_folder}!")
 

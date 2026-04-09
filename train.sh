@@ -70,7 +70,7 @@ python generate_cam_masks.py \
   --dataname "${DATASET_NAME}" \
   --dataset_dir "${DATA_DIR}" \
   --output "${STAGE1_OUT}" \
-  --img_size 448 \
+  --img_size 224 \
   --num_class ${NUM_CLASS} \
   --backbone resnet50 \
   --keep_input_proj \

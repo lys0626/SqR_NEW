@@ -33,7 +33,7 @@ def parser_args():
     # == 原有基础参数 ==
     parser.add_argument('--dataname', default='nih', choices=['coco14', 'mimic', 'nih'])
     parser.add_argument('--dataset_dir', default='/comp_robot')
-    parser.add_argument('--img_size', default=448, type=int)
+    parser.add_argument('--img_size', default=224, type=int)
     parser.add_argument('--output', metavar='DIR', help='path to output folder')
     parser.add_argument('--num_class', default=14, type=int)
     parser.add_argument('--pretrained', dest='pretrained', action='store_true')
@@ -72,7 +72,9 @@ def parser_args():
     parser.add_argument('--pre_norm', action='store_true')
     parser.add_argument('--position_embedding', default='sine', type=str)
     parser.add_argument('--backbone', default='resnet50', type=str)
-    
+    parser.add_argument('--keep_other_self_attn_dec', action='store_true')
+    parser.add_argument('--keep_first_self_attn_dec', action='store_true')
+    parser.add_argument('--keep_input_proj', action='store_true')
     # ================= 标签级 MEE 核心对齐参数 =================
     parser.add_argument('--splicemix_start_epoch', default=10, type=int, help='Epoch 截断节点 (Stage 1 退出点)')
     parser.add_argument('--warm_up_epochs', default=6, type=int, help='前几个 Epoch 不记录 FkL')
@@ -240,25 +242,20 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
     for images, targets, indices in loader:
         images, targets = images.to(device), targets.to(device)
         indices = indices.to(device)
-        images.requires_grad_(True)
-        
-        logits = ensemble_logits(models, images)
-        probs = torch.sigmoid(logits)
-        
-        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        conf = torch.abs(probs - 0.5)  # 偏离 0.5 越远代表置信度越高
-        
-        total_loss = bce_loss.sum()
-        grads = torch.autograd.grad(total_loss, images)[0]
-        g_norms = torch.norm(grads.flatten(1), dim=1).unsqueeze(1).expand(-1, num_classes)
-        
-        loss_tensor[indices] = bce_loss.detach()
-        conf_tensor[indices] = conf.detach()
-        grad_tensor[indices] = g_norms.detach()
-
-        images.requires_grad_(False)
-        del grads, total_loss, logits, probs, bce_loss
-        torch.cuda.empty_cache()
+        with torch.no_grad(): # ⚠️ 修改2：整个过程可以放在 no_grad 下，大幅降低显存消耗
+            logits = ensemble_logits(models, images)
+            probs = torch.sigmoid(logits)
+            
+            bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+            conf = torch.abs(probs - 0.5)  # 偏离 0.5 越远代表置信度越高
+            
+            # ⚠️ 修改3：真正的标签级梯度范数计算
+            # 依据 BCE 损失特性，Loss 对 Logits 的梯度的绝对值正是 |probs - targets|
+            g_norms = torch.abs(probs - targets)
+            
+            loss_tensor[indices] = bce_loss.detach()
+            conf_tensor[indices] = conf.detach()
+            grad_tensor[indices] = g_norms.detach()
 
     fkl_indices = torch.nonzero(fkl_mask) 
     M = len(fkl_indices)
@@ -424,7 +421,8 @@ def main():
                     if round_num == 1:
                         logger.info(f"\n>>> [Round 1] Executing Label-Level Early Cutting (Blacklist Mode)... <<<")
                         fkl_mask, mee_noisy_mask = perform_label_level_early_cutting(models, train_dataset_eval, fkl_mask, args, logger, device)
-                        global_label_mask = global_label_mask & (~mee_noisy_mask)
+                        # ⚠️ 关键修复：下一轮的干净标签 = (上一轮的干净标签) AND (FkL白名单) AND (非MEE黑名单)
+                        global_label_mask = global_label_mask & fkl_mask & (~mee_noisy_mask)
                     else:
                         logger.info(f"\n>>> [Round {round_num}] Using pure FkL filtering (Whitelist Mode)... <<<")
                         global_label_mask = global_label_mask & fkl_mask    
