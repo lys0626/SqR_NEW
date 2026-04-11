@@ -13,14 +13,14 @@ import torch.backends.cudnn as cudnn
 import torch.utils.data
 
 from torch.utils.tensorboard import SummaryWriter
-
+import csv
 from lib.dataset.get_dataset import get_datasets
 from lib.utils.logger import setup_logger
 from lib.models.query2label import build_q2l
 from lib.utils.metric import AveragePrecisionMeter
 from lib.utils.misc import clean_state_dict
 from lib.utils.slconfig import get_raw_dict
-
+from collections import defaultdict
 from lib.models.aslloss import AsymmetricLossOptimized
 
 def sec_to_str(seconds):
@@ -37,17 +37,16 @@ def parser_args():
     parser.add_argument('--output', metavar='DIR', help='path to output folder')
     parser.add_argument('--num_class', default=14, type=int)
     parser.add_argument('--pretrained', dest='pretrained', action='store_true')
-    parser.add_argument('--optim', default='SGD', type=str, choices=['AdamW', 'SGD'])
+    parser.add_argument('--optim', default='AdamW', type=str, choices=['AdamW', 'SGD'])
     parser.add_argument('--scheduler', default='OneCycle', type=str)
     parser.add_argument('--step_size', default=40, type=int)
     parser.add_argument('--gamma', default=0.1, type=float)
     parser.add_argument('--momentum', default=0.9, type=float)
     
-    parser.add_argument('--eps', default=1e-5, type=float)
-    parser.add_argument('--dtgfl', action='store_true', default=False)              
+    parser.add_argument('--eps', default=1e-5, type=float)           
     parser.add_argument('--gamma_pos', default=0, type=float)
-    parser.add_argument('--gamma_neg', default=2, type=float)
-    parser.add_argument('--loss_clip', default=0.0, type=float)  
+    parser.add_argument('--gamma_neg', default=4, type=float)
+    parser.add_argument('--loss_clip', default=0.05, type=float)  
 
     parser.add_argument('-j', '--workers', default=8, type=int)
     parser.add_argument('--epochs', default=80, type=int)
@@ -76,7 +75,6 @@ def parser_args():
     parser.add_argument('--keep_first_self_attn_dec', action='store_true')
     parser.add_argument('--keep_input_proj', action='store_true')
     # ================= 标签级 MEE 核心对齐参数 =================
-    parser.add_argument('--splicemix_start_epoch', default=10, type=int, help='Epoch 截断节点 (Stage 1 退出点)')
     parser.add_argument('--warm_up_epochs', default=6, type=int, help='前几个 Epoch 不记录 FkL')
     parser.add_argument('--fkl_consecutive_epochs', default=3, type=int, help='需要连续多少次预测正确才算候选干净标签')
     
@@ -130,8 +128,13 @@ def build_dual_optimizers(net1, net2, args):
             else: other.append(param)
         return [{"params": backbone, "lr": args.lr * 0.1}, {"params": other, "lr": args.lr}]
     
-    opt1 = torch.optim.SGD(get_params(net1), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-    opt2 = torch.optim.SGD(get_params(net2), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    if args.optim == 'AdamW':
+        opt1 = torch.optim.AdamW(get_params(net1), lr=args.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=args.weight_decay)
+        opt2 = torch.optim.AdamW(get_params(net2), lr=args.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=args.weight_decay)
+        
+    elif args.optim == 'SGD':
+        opt1 = torch.optim.SGD(get_params(net1), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
+        opt2 = torch.optim.SGD(get_params(net2), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
     return opt1, opt2
 
 def ensemble_logits(models, x):
@@ -175,17 +178,43 @@ def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, 
             z1, _, _, _ = net1(images)
             z2, _, _, _ = net2(images)
             
-            # 使用 BCE 计算 Hard Loss，保持维度 [Batch, 14]，并用 batch_mask 屏蔽掉脏标签
-            hard1 = F.binary_cross_entropy_with_logits(z1, targets.float(), reduction='none')
-            hard2 = F.binary_cross_entropy_with_logits(z2, targets.float(), reduction='none')
+            # # 使用 BCE 计算 Hard Loss，保持维度 [Batch, 14]，并用 batch_mask 屏蔽掉脏标签
+            # hard1 = F.binary_cross_entropy_with_logits(z1, targets.float(), reduction='none')
+            # hard2 = F.binary_cross_entropy_with_logits(z2, targets.float(), reduction='none')
+            # soft1_loss = F.binary_cross_entropy_with_logits(z1 / temperature, soft2_comb, reduction='none') * (temperature ** 2)
+            # soft2_loss = F.binary_cross_entropy_with_logits(z2 / temperature, soft1_comb, reduction='none') * (temperature ** 2)
+            # # 聚合总 Loss，只对 Mask=1 的干净标签求均值
+            # loss1 = ((hard1 + alpha * soft1_loss) * batch_mask).sum() / max(1.0, batch_mask.sum().item())
+            # loss2 = ((hard2 + alpha * soft2_loss) * batch_mask).sum() / max(1.0, batch_mask.sum().item())
+
+
+
+            # ==========================================================
+            # 1. Hard Loss 区域：使用 ASL + Hack Mask (对抗标签不平衡)
+            # ==========================================================
+            masked_z1 = z1.clone()
+            masked_z2 = z2.clone()
             
+            ignore_idx = (batch_mask == 0)
+            
+            # 把被认定为脏标签的位置，强行改成符合 target 的极值，使其 ASL Loss 为 0
+            masked_z1[ignore_idx] = 20.0
+            masked_z2[ignore_idx] = 20.0
+
+            # 真正调用 ASL 计算 Hard Loss！
+            hard1 = criterion(masked_z1, targets.float())
+            hard2 = criterion(masked_z2, targets.float())
             # Soft Loss 同样屏蔽
             soft1_loss = F.binary_cross_entropy_with_logits(z1 / temperature, soft2_comb, reduction='none') * (temperature ** 2)
             soft2_loss = F.binary_cross_entropy_with_logits(z2 / temperature, soft1_comb, reduction='none') * (temperature ** 2)
-            
-            # 聚合总 Loss，只对 Mask=1 的干净标签求均值
-            loss1 = ((hard1 + alpha * soft1_loss) * batch_mask).sum() / max(1.0, batch_mask.sum().item())
-            loss2 = ((hard2 + alpha * soft2_loss) * batch_mask).sum() / max(1.0, batch_mask.sum().item())
+
+            # ==========================================================
+            # 3. 聚合总 Loss
+            # ==========================================================
+            # hard 已经是处理过 mask 的均值标量了
+            # soft 还是 [Batch, 14] 矩阵，需要乘 batch_mask 屏蔽脏标签后求均值
+            loss1 = hard1 + alpha * (soft1_loss * batch_mask).sum() / max(1.0, batch_mask.sum().item())
+            loss2 = hard2 + alpha * (soft2_loss * batch_mask).sum() / max(1.0, batch_mask.sum().item())
 
         opt1.zero_grad()
         scaler.scale(loss1).backward()
@@ -207,14 +236,18 @@ def update_fkl_mask(models, loader, device, fkl_consecutive_counts, fkl_mask, co
         indices = indices.to(device, non_blocking=True)
         
         logits = ensemble_logits(models, x)
-        preds = (torch.sigmoid(logits) > 0.5).float()
+        preds = (torch.sigmoid(logits) > 0.2).float()
         
-        # 判断每个标签是否预测正确 [Batch, 14]
-        is_correct = (preds == y)
+        # ==========================================================
+        # 🌟 核心修改：只统计原本标注为 1 的正标签
+        # ==========================================================
+        # 条件 1: 预测正确 (preds == y)
+        # 条件 2: 真实标签为正类 (y == 1)
+        is_correct_and_positive = (preds == y) & (y == 1)
         
         counts = fkl_consecutive_counts[indices]
         # 如果预测正确，连续次数+1；一旦错误，直接归零
-        counts = torch.where(is_correct, counts + 1, torch.zeros_like(counts))
+        counts = torch.where(is_correct_and_positive, counts + 1, torch.zeros_like(counts))
         fkl_consecutive_counts[indices] = counts
         
         # 只要连续正确次数达到阈值，就标为候选干净标签
@@ -222,79 +255,135 @@ def update_fkl_mask(models, loader, device, fkl_consecutive_counts, fkl_mask, co
         fkl_mask[indices] = fkl_mask[indices] | new_fkl
 
 
-def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, device):
+
+
+def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, device,all_targets):
     """
-    标签级 MEE 截断 (防 OOM 优化版)
+    严格对齐原版 MEE 逻辑：高 Loss (候选) -> 高置信度 + 低输入梯度范数 (确诊噪声)
     """
     for m in models: m.eval()
-    eval_bs = max(1, args.batch_size // 2)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=eval_bs, shuffle=False, num_workers=args.workers)
     
     num_samples = len(dataset)
     num_classes = args.num_class
-    mee_noisy_mask = torch.zeros_like(fkl_mask)
-    loss_tensor = torch.zeros((num_samples, num_classes), dtype=torch.float32).to(device)
-    conf_tensor = torch.zeros((num_samples, num_classes), dtype=torch.float32).to(device)
-    grad_tensor = torch.zeros((num_samples, num_classes), dtype=torch.float32).to(device)
     
-    logger.info("    -> Calculating Loss, Confidence, and Gradient Norm across all samples for Early Cutting...")
+    # ==========================================================
+    # 阶段 1：全局无梯度扫一遍，寻找 High Loss 候选标签
+    # ==========================================================
+    logger.info("    -> Step 1: Calculating BCE Loss across FkL candidates (No Grad)...")
+    eval_bs = max(1, args.batch_size // 2)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=eval_bs, shuffle=False, num_workers=args.workers)
+    
+    loss_tensor = torch.zeros((num_samples, num_classes), dtype=torch.float32).to(device)
     
     for images, targets, indices in loader:
         images, targets = images.to(device), targets.to(device)
         indices = indices.to(device)
-        with torch.no_grad(): # ⚠️ 修改2：整个过程可以放在 no_grad 下，大幅降低显存消耗
+        with torch.no_grad():
             logits = ensemble_logits(models, images)
-            probs = torch.sigmoid(logits)
-            
-            bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-            conf = torch.abs(probs - 0.5)  # 偏离 0.5 越远代表置信度越高
-            
-            # ⚠️ 修改3：真正的标签级梯度范数计算
-            # 依据 BCE 损失特性，Loss 对 Logits 的梯度的绝对值正是 |probs - targets|
-            g_norms = torch.abs(probs - targets)
-            
+            bce_loss = F.binary_cross_entropy_with_logits(logits, targets.float(), reduction='none')
             loss_tensor[indices] = bce_loss.detach()
-            conf_tensor[indices] = conf.detach()
-            grad_tensor[indices] = g_norms.detach()
 
-    fkl_indices = torch.nonzero(fkl_mask) 
-    M = len(fkl_indices)
-    logger.info(f"    -> Found {M} FkL label candidates out of {num_samples * num_classes} total labels.")
+    fkl_indices = torch.nonzero(fkl_mask) # [M, 2], 每一行是 [sample_idx, class_idx]
+    # 提取全局 Target 矩阵中原本标注为 1 的位置
+    positive_targets = (all_targets == 1)
 
-    if M > 0:
-        fkl_losses = loss_tensor[fkl_mask]
-        fkl_confs = conf_tensor[fkl_mask]
-        fkl_grads = grad_tensor[fkl_mask]
+    # 只计算那些原本标注为 1 的标签里的 FkL
+    fkl_indices = torch.nonzero(fkl_mask & positive_targets)
+    M = len(fkl_indices) 
+    # 此时的 M 才是真正有意义的“疾病候选者”，通常只有几万的数量级
+    logger.info(f"    -> Found {M} FkL label candidates.")
+
+    if M == 0:
+        return fkl_mask, torch.zeros_like(fkl_mask)
+
+    # 提取 FkL 对应的 Loss 并排序，截断获取 num_candidates
+    fkl_losses = loss_tensor[fkl_mask]
+    num_candidates = int(M / args.early_cutting_rate)
+    num_candidates = min(args.newremove_rate, num_candidates)
+    
+    _, sorted_idx = torch.sort(fkl_losses, descending=True)
+    cand_local_idx = sorted_idx[:num_candidates] 
+    cand_global_indices = fkl_indices[cand_local_idx] # 截取出真正的候选标签索引 [num_candidates, 2]
+    
+    logger.info(f"    -> Step 2: Calculating Confidence and INPUT GRADIENT NORM for {num_candidates} specific labels...")
+
+    # ==========================================================
+    # 阶段 2：仅对候选样本开启梯度计算，严格提取 Input Gradient Norm
+    # ==========================================================
+    # 构建候选样本的字典映射：sample_idx -> [(class_idx, global_array_index), ...]
+    sample_to_cand_classes = defaultdict(list)
+    for i, (s_idx, c_idx) in enumerate(cand_global_indices.cpu().numpy()):
+        sample_to_cand_classes[s_idx].append((c_idx, i))
+
+    # 构建专属的 Subset DataLoader，避免对无关图片进行前向传播
+    unique_sample_indices = list(sample_to_cand_classes.keys())
+    subset = torch.utils.data.Subset(dataset, unique_sample_indices)
+    
+    # ==========================================================
+    # 🌟 核心修复：强制缩小 Step 2 的 Batch Size，并清空显存碎片
+    # ==========================================================
+    torch.cuda.empty_cache()  # 释放 Step 1 遗留的无用显存
+    
+    grad_bs = 8  # ⚠️ 针对 24G 显卡 + 4模型集成的安全阈值 (若显存更大可设为 16)
+    
+    logger.info(f"    -> [Memory Protector] Re-building subset loader with ultra-small batch size: {grad_bs}")
+    
+    subset_loader = torch.utils.data.DataLoader(subset, batch_size=grad_bs, shuffle=False, num_workers=args.workers)
+    # ==========================================================
+
+    conf_arr = torch.zeros(num_candidates, dtype=torch.float32).to(device)
+    grad_arr = torch.zeros(num_candidates, dtype=torch.float32).to(device)
+
+    for images, targets, indices in subset_loader:
+        images, targets = images.to(device), targets.to(device)
+        indices = indices.numpy()
         
-        num_candidates = int(M / args.early_cutting_rate)
-        num_candidates = min(args.newremove_rate, num_candidates)
+        # 【关键】：开启输入图片的梯度追踪
+        images.requires_grad_(True)
+        logits = ensemble_logits(models, images)
+        probs = torch.sigmoid(logits)
         
-        _, sorted_idx = torch.sort(fkl_losses, descending=True)
-        cand_idx = sorted_idx[:num_candidates] 
-        
-        cand_confs = fkl_confs[cand_idx]
-        cand_grads = fkl_grads[cand_idx]
-        
-        if len(cand_idx) > 0:
-            conf_thresh = torch.quantile(cand_confs, 1.0 - args.top_conf_ratio)
-            grad_thresh = torch.quantile(cand_grads, args.low_grad_ratio)
+        # 针对当前 Batch 中的每一张图片
+        for b in range(len(indices)):
+            s_idx = indices[b]
+            c_list = sample_to_cand_classes[s_idx] # 这张图里有哪些标签是 Candidate?
             
-            is_mee = (cand_confs >= conf_thresh) & (cand_grads <= grad_thresh)
-            mee_local_idx = cand_idx[is_mee]
-            
-            mee_count = len(mee_local_idx)
-            logger.info(f"    -> MEE Refinement Thresholds: Conf >= {conf_thresh:.4f}, Grad <= {grad_thresh:.4f}")
-            logger.info(f"    -> Final MEE Labels CUT from Clean pool: {mee_count}")
-            
-            if mee_count > 0:
-                mee_global_indices = fkl_indices[mee_local_idx]
-                # 【旧代码】：直接在 fkl_mask 上把候选置为 False
-                # fkl_mask[mee_global_indices[:, 0], mee_global_indices[:, 1]] = False
+            for (c_idx, global_i) in c_list:
+                # 1. 计算置信度 (偏离 0.5 的程度)
+                conf_arr[global_i] = torch.abs(probs[b, c_idx] - 0.2).detach()
                 
-                # 【新代码】：我们不动 fkl_mask，而是把确凿的噪声记录在 mee_noisy_mask 里
-                mee_noisy_mask[mee_global_indices[:, 0], mee_global_indices[:, 1]] = True
+                # 2. 核心修复：计算特定标签 Loss 对输入图片 x 的梯度范数
+                loss_c = F.binary_cross_entropy_with_logits(logits[b:b+1, c_idx], targets[b:b+1, c_idx].float())
                 
-    # 【修改返回值】：同时返回原始的 fkl_mask 和找出的 噪声 mask
+                # retain_graph=True 是必须的，因为同一张图片可能存在多个标签都是 Candidate
+                g = torch.autograd.grad(loss_c, images, retain_graph=True)[0]
+                
+                # 提取对应图片的梯度并求范数
+                g_img = g[b]
+                gnorm = torch.norm(g_img.flatten())
+                grad_arr[global_i] = gnorm.detach()
+
+        # 释放梯度内存
+        images.requires_grad_(False)
+
+    # ==========================================================
+    # 阶段 3：执行 MEE Refinement (高 Conf AND 低 Grad)
+    # ==========================================================
+    conf_thresh = torch.quantile(conf_arr, 1.0 - args.top_conf_ratio)
+    grad_thresh = torch.quantile(grad_arr, args.low_grad_ratio)
+    
+    is_mee = (conf_arr >= conf_thresh) & (grad_arr <= grad_thresh)
+    mee_local_idx = torch.arange(num_candidates)[is_mee.cpu()]
+    
+    mee_count = len(mee_local_idx)
+    logger.info(f"    -> MEE Refinement Thresholds: Conf >= {conf_thresh:.4f}, Grad <= {grad_thresh:.4f}")
+    logger.info(f"    -> Final MEE Labels CUT from Clean pool: {mee_count}")
+    
+    mee_noisy_mask = torch.zeros_like(fkl_mask)
+    if mee_count > 0:
+        final_mee_indices = cand_global_indices[mee_local_idx]
+        mee_noisy_mask[final_mee_indices[:, 0], final_mee_indices[:, 1]] = True
+            
     return fkl_mask, mee_noisy_mask
 def pick_remove_rate_by_phase(rn, i1, i2, i3, r1, r2, r3, r4):
     """根据当前的 Round 轮次，匹配对应的 remove_rate"""
@@ -315,6 +404,31 @@ def get_fkl_required_epochs(rn, i1, i2, i3):
         return 3
     else:
         return 4
+@torch.inference_mode()
+def validate_with_meter(models, val_loader, device):
+    """
+    使用 metric.py 中的 AveragePrecisionMeter 进行全面验证
+    """
+    for m in models: 
+        m.eval()
+        
+    # 实例化你提供的评估器
+    meter = AveragePrecisionMeter()
+    
+    for images, targets, _ in val_loader:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        
+        # MEE 方法：获取四个网络的集成 logits
+        logits = ensemble_logits(models, images)
+        
+        # 将当前 batch 的 logits 和真实标签输入到 meter 中
+        # 注意：meter 内部源码做了 sigmoid，所以这里直接传 logits 即可
+        meter.add(logits.detach(), targets.detach())
+        
+    # 计算并返回所有指标的字典
+    metrics_dict = meter.compute_all_metrics()
+    return metrics_dict
 def main():
     args = parser_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.cuda_devices[0])
@@ -334,13 +448,22 @@ def main():
     # 无增强测试 Loader
     train_dataset_eval = deepcopy(train_dataset)
     train_dataset_eval.transform = val_dataset.transform
-
-    criterion = AsymmetricLossOptimized(gamma_neg=args.gamma_neg, gamma_pos=args.gamma_pos, clip=args.loss_clip, disable_torch_grad_focal_loss=args.dtgfl)
+    # ================= 🌟 新增：定义验证集 Loader =================
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=args.workers,
+        pin_memory=True  # 推荐加上，可以加速数据转移到显存
+    )
+    # ===============================================================
+    criterion = AsymmetricLossOptimized(gamma_neg=args.gamma_neg, gamma_pos=args.gamma_pos, clip=args.loss_clip, disable_torch_grad_focal_loss=False)
 
     # 提取全局 Target 矩阵，用于最终的 Clean > Noisy 投票
     etrain_loader = torch.utils.data.DataLoader(train_dataset_eval, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     num_train_samples = len(train_dataset)
     all_targets = torch.zeros((num_train_samples, args.num_class), dtype=torch.bool).to(device)
+    #取出训练集中的所有标签，根据索引，保存True或False到all_targets中
     for _, targets, indices in etrain_loader:
         all_targets[indices] = (targets == 1).to(device)
 
@@ -352,9 +475,15 @@ def main():
     # 初始状态下，所有标签都视为“干净”（参与训练）
 
     global_label_mask = torch.ones((num_train_samples, args.num_class), dtype=torch.bool).to(device)
-    num_rounds = getattr(args, 'num_rounds', 3) 
     num_rounds = args.i_rate_1 + args.i_rate_2 + args.i_rate_3 + args.i_rate_4
     logger.info(f"=================== Stage 1 Training Start (Multi-Round Mode: {num_rounds} Rounds) ===================")
+    # ================= 🌟 补充缺失的初始化 =================
+    best_global_auroc = 0.0
+    metrics_csv_path = os.path.join(args.output, 'training_metrics.csv')
+    with open(metrics_csv_path, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Round', 'Epoch', 'Val_mAUC', 'Val_mAcc', 'Val_Macro_F1', 'FkL_Candidates', 'Remaining_Clean_Pool'])
+    # ========================================================
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, drop_last=True)
     
     # ================= 修改三：真正激活 Multi-Round 逻辑 =================
@@ -382,6 +511,32 @@ def main():
             train_one_epoch_mutual_kd(net1, net2, ema1.ema_model, ema2.ema_model, ema1, ema2, opt1, opt2, train_loader, criterion, args, device, global_label_mask)
             sch1.step()
             sch2.step()
+            # ================== 🌟 直接调用 Meter 验证并保存最佳权重 ==================
+            val_metrics = validate_with_meter(models, val_loader, device)
+            
+            # 提取你关心的核心指标
+            val_auroc = val_metrics.get('mAUC', 0.0)
+            val_acc = val_metrics.get('mAcc', 0.0)
+            val_macro_f1 = val_metrics.get('macro_F1', 0.0)
+            
+            logger.info(f"    -> Epoch {epoch + 1} Val mAUC: {val_auroc:.4f} | mAcc: {val_acc:.4f} | Macro F1: {val_macro_f1:.4f}")
+            
+            # 仍然使用 mAUC 作为保存最佳模型的唯一标准 (医学影像多标签的黄金标准)
+            if val_auroc > best_global_auroc:
+                best_global_auroc = val_auroc
+                best_ckpt_path = os.path.join(args.output, 'best_stage1_model.pth')
+                
+                logger.info(f"    >>> [Best Model] Saving new best model (mAUC: {best_global_auroc:.4f}) to {best_ckpt_path} <<<")
+                torch.save({
+                    'round': round_num,
+                    'epoch': epoch,
+                    'net1': net1.state_dict(),
+                    'net2': net2.state_dict(),
+                    'net1_ema': ema1.ema_model.state_dict(),
+                    'net2_ema': ema2.ema_model.state_dict(),
+                    'best_auroc': best_global_auroc
+                }, best_ckpt_path)
+            # ================================================================
             # 2. 追踪标签级 FkL
             if epoch >= args.warm_up_epochs:
                 logger.info("    -> Tracking LABEL-LEVEL predictions for FkL...")
@@ -415,17 +570,24 @@ def main():
                 # ====================================================================
                 
                 logger.info(f"    -> Current FkL Candidates: {current_fkl_count} (Dynamic Threshold: {dynamic_threshold})")
-                
+                logger.info(f"    -> Current pool size: {current_pool_size})")
                 # === 核心逻辑：使用动态及格线判断是否达到截断条件 ===
                 if current_fkl_count >= dynamic_threshold or epoch == args.epochs - 1:
+                    # ==========================================================
+                    # 🌟 核心修复：无条件信任负样本（给所有 target == 0 颁发免死金牌）
+                    # ==========================================================
+                    negative_targets_mask = ~all_targets
                     if round_num == 1:
                         logger.info(f"\n>>> [Round 1] Executing Label-Level Early Cutting (Blacklist Mode)... <<<")
-                        fkl_mask, mee_noisy_mask = perform_label_level_early_cutting(models, train_dataset_eval, fkl_mask, args, logger, device)
-                        # ⚠️ 关键修复：下一轮的干净标签 = (上一轮的干净标签) AND (FkL白名单) AND (非MEE黑名单)
-                        global_label_mask = global_label_mask & fkl_mask & (~mee_noisy_mask)
+                        fkl_mask, mee_noisy_mask = perform_label_level_early_cutting(models, train_dataset_eval, fkl_mask, args, logger, device,all_targets)
+                        
+                        # ⚠️ 真正的干净标签 = (FkL选出的正标签 OR 默认干净的负标签) AND (非MEE黑名单)
+                        global_label_mask = global_label_mask & (fkl_mask | negative_targets_mask) & (~mee_noisy_mask)
                     else:
                         logger.info(f"\n>>> [Round {round_num}] Using pure FkL filtering (Whitelist Mode)... <<<")
-                        global_label_mask = global_label_mask & fkl_mask    
+                        
+                        # ⚠️ 真正的干净标签 = (FkL选出的正标签 OR 默认干净的负标签)
+                        global_label_mask = global_label_mask & (fkl_mask | negative_targets_mask)    
                     # 判断是否是最后一轮
                     if round_num == num_rounds:
                         logger.info(f"\n>>> Final Round {round_num} Reached. Executing Sample-Level Voting & Exiting! <<<")
