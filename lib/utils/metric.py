@@ -78,7 +78,7 @@ class AveragePrecisionMeter(object):
         mAUC = np.mean(valid_aucs) if valid_aucs else 0.0
 
         # 2. 计算预测标签 (阈值设为 0.5)
-        y_pred = (y_probs >= 0.2).astype(int)
+        y_pred = (y_probs >= 0.35).astype(int)
 
         # ========================================================
         # 3. 新增: 计算 Label-wise Binary Accuracy (方式 B)

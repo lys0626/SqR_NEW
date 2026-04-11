@@ -69,7 +69,6 @@ class Qeruy2Label(nn.Module):
         hidden_dim = transfomer.d_model
         #将backbone输出的特征图通道数转换为transformer所需的隐藏层维度
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
-        self.fc_splicemix = nn.Linear(2048, self.num_class)
         #num_embeddings指的是词库大小，即该数据集一共有多少个类别
         #embedding_dim特征维度，每个类别对应的特征向量的长度 
         #可学习参数，如果使用别人已经训练好的词向量(Word2Vec, GloVe等)，可以冻结该层的参数
@@ -114,17 +113,13 @@ class Qeruy2Label(nn.Module):
             out_features = None
             out_logits = None
             attn_weights = None # 【修改点】
-
-        # 4. --- 路径 B: SpliceMix 分支 --- 
-        features_pooled = src.amax(dim=[2, 3])
-        out_splicemix = self.fc_splicemix(features_pooled)
         
         # 【修改点】：如果要求返回注意力图，则包含 attn_weights
         if return_attn:
-            return out_logits, out_features, out_splicemix, src, attn_weights
+            return out_logits, out_features, src, attn_weights
             
         # 正常训练默认不返回，节省显存与带宽
-        return out_logits, out_features, out_splicemix, src
+        return out_logits, out_features, src
 
     #收集除了骨干网络backbone以外的所有可训练参数,以便在优化器中对它们进行单独的配置(通常是设置更高的学习率)
     def finetune_paras(self):

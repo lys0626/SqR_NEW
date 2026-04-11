@@ -76,7 +76,7 @@ def parser_args():
     parser.add_argument('--keep_input_proj', action='store_true')
     # ================= 标签级 MEE 核心对齐参数 =================
     parser.add_argument('--warm_up_epochs', default=6, type=int, help='前几个 Epoch 不记录 FkL')
-    parser.add_argument('--fkl_consecutive_epochs', default=3, type=int, help='需要连续多少次预测正确才算候选干净标签')
+    parser.add_argument('--fkl_consecutive_epochs', default=5, type=int, help='需要连续多少次预测正确才算候选干净标签')
     
     parser.add_argument('--early_cutting_rate', default=1.5, type=float)
     parser.add_argument('--newremove_rate', default=90000, type=int, help='标签级候选截断最大数量')
@@ -139,10 +139,10 @@ def build_dual_optimizers(net1, net2, args):
 
 def ensemble_logits(models, x):
     net1, net2, net1e, net2e = models
-    out1, _, _, _ = net1(x)
-    out2, _, _, _ = net2(x)
-    out1e, _, _, _ = net1e(x)
-    out2e, _, _, _ = net2e(x)
+    out1, _, _ = net1(x)
+    out2, _, _ = net2(x)
+    out1e, _, _ = net1e(x)
+    out2e, _, _ = net2e(x)
     return (out1 + out2 + out1e + out2e) / 4.0
 
 def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, loader, criterion, args, device, global_label_mask):
@@ -161,11 +161,11 @@ def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, 
         batch_mask = global_label_mask[indices].float()
 
         with torch.no_grad():
-            t1, _, _, _ = net1(images)
-            t2, _, _, _ = net2(images)
-            t1e, _, _, _ = net1e(images)
-            t2e, _, _, _ = net2e(images)
-            
+            t1, _,  _ = net1(images)
+            t2, _,  _ = net2(images)
+            t1e, _,  _ = net1e(images)
+            t2e, _,  _ = net2e(images)
+            #之后可以修改为不使用temperature，比较一下效果
             soft1 = torch.sigmoid(t1 / temperature)
             soft2 = torch.sigmoid(t2 / temperature)
             soft1e = torch.sigmoid(t1e / temperature)
@@ -175,8 +175,8 @@ def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, 
             soft2_comb = (soft2 + soft2e) / 2.0
 
         with torch.cuda.amp.autocast(enabled=args.amp):
-            z1, _, _, _ = net1(images)
-            z2, _, _, _ = net2(images)
+            z1, _,  _ = net1(images)
+            z2, _,  _ = net2(images)
             
             # # 使用 BCE 计算 Hard Loss，保持维度 [Batch, 14]，并用 batch_mask 屏蔽掉脏标签
             # hard1 = F.binary_cross_entropy_with_logits(z1, targets.float(), reduction='none')
@@ -236,7 +236,7 @@ def update_fkl_mask(models, loader, device, fkl_consecutive_counts, fkl_mask, co
         indices = indices.to(device, non_blocking=True)
         
         logits = ensemble_logits(models, x)
-        preds = (torch.sigmoid(logits) > 0.2).float()
+        preds = (torch.sigmoid(logits) > 0.35).float()
         
         # ==========================================================
         # 🌟 核心修改：只统计原本标注为 1 的正标签
@@ -283,7 +283,6 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
             bce_loss = F.binary_cross_entropy_with_logits(logits, targets.float(), reduction='none')
             loss_tensor[indices] = bce_loss.detach()
 
-    fkl_indices = torch.nonzero(fkl_mask) # [M, 2], 每一行是 [sample_idx, class_idx]
     # 提取全局 Target 矩阵中原本标注为 1 的位置
     positive_targets = (all_targets == 1)
 
@@ -319,10 +318,7 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
     unique_sample_indices = list(sample_to_cand_classes.keys())
     subset = torch.utils.data.Subset(dataset, unique_sample_indices)
     
-    # ==========================================================
-    # 🌟 核心修复：强制缩小 Step 2 的 Batch Size，并清空显存碎片
-    # ==========================================================
-    torch.cuda.empty_cache()  # 释放 Step 1 遗留的无用显存
+    torch.cuda.empty_cache() 
     
     grad_bs = 8  # ⚠️ 针对 24G 显卡 + 4模型集成的安全阈值 (若显存更大可设为 16)
     
@@ -350,7 +346,7 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
             
             for (c_idx, global_i) in c_list:
                 # 1. 计算置信度 (偏离 0.5 的程度)
-                conf_arr[global_i] = torch.abs(probs[b, c_idx] - 0.2).detach()
+                conf_arr[global_i] = torch.abs(probs[b, c_idx] - 0.35).detach()
                 
                 # 2. 核心修复：计算特定标签 Loss 对输入图片 x 的梯度范数
                 loss_c = F.binary_cross_entropy_with_logits(logits[b:b+1, c_idx], targets[b:b+1, c_idx].float())
@@ -467,9 +463,9 @@ def main():
     for _, targets, indices in etrain_loader:
         all_targets[indices] = (targets == 1).to(device)
 
-    # 标签级FkL矩阵初始化
-    fkl_consecutive_counts = torch.zeros((num_train_samples, args.num_class), dtype=torch.int32).to(device)
-    fkl_mask = torch.zeros((num_train_samples, args.num_class), dtype=torch.bool).to(device)
+    # 标签级FkL矩阵初始化  冗余代码
+    # fkl_consecutive_counts = torch.zeros((num_train_samples, args.num_class), dtype=torch.int32).to(device)
+    # fkl_mask = torch.zeros((num_train_samples, args.num_class), dtype=torch.bool).to(device)
 
     # === 初始化全局掩码 ===
     # 初始状态下，所有标签都视为“干净”（参与训练）
@@ -553,8 +549,9 @@ def main():
                 # 你的 all_targets 矩阵完美记录了所有 Target == 1 的位置
                 
                 # 1. 统计当前满足连续预测正确的候选者中，属于“真正疾病(正标签)”的数量
-                current_fkl_count = (fkl_mask & all_targets).sum().item()
-                
+                # current_fkl_count = (fkl_mask & all_targets).sum().item()
+                # 强制交集：只有同时属于“模型预测容易学的” AND “上一轮没被踢出去的” AND “原本就是正标签的”，才算作有效候选者
+                current_fkl_count = (fkl_mask & global_label_mask & all_targets).sum().item()
                 # 2. 获取本阶段的保留比例
                 current_remove_rate = pick_remove_rate_by_phase(
                     round_num,
