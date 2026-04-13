@@ -94,10 +94,10 @@ def parser_args():
     parser.add_argument("--i_rate_4", type=int, default=0)
     
     # 动态保留比例 (注意：在 MEE 中 remove_rate 其实是 "保留的干净样本比例")
-    parser.add_argument("--remove_rate_1", type=float, default=0.995)
-    parser.add_argument("--remove_rate_2", type=float, default=0.995)
-    parser.add_argument("--remove_rate_3", type=float, default=0.995)
-    parser.add_argument("--remove_rate_4", type=float, default=0.995)
+    parser.add_argument("--remove_rate_1", type=float, default=0.99)
+    parser.add_argument("--remove_rate_2", type=float, default=0.99)
+    parser.add_argument("--remove_rate_3", type=float, default=0.99)
+    parser.add_argument("--remove_rate_4", type=float, default=0.99)
     args = parser.parse_args()
     return args
 
@@ -145,9 +145,12 @@ def ensemble_logits(models, x):
     out2e, _, _ = net2e(x)
     return (out1 + out2 + out1e + out2e) / 4.0
 
-def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, loader, criterion, args, device, global_label_mask):
+def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, loader, criterion, args, device, global_label_mask,sch1,sch2):
     net1.train()
     net2.train()
+    # 确保 EMA 是 eval 模式
+    net1e.eval()
+    net2e.eval()
     temperature = 2.0
     alpha = 0.5
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
@@ -160,38 +163,23 @@ def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, 
         # 获取当前 batch 在全局矩阵中被判定为干净的标签掩码 [Batch, 14]
         batch_mask = global_label_mask[indices].float()
 
-        with torch.no_grad():
-            t1, _,  _ = net1(images)
-            t2, _,  _ = net2(images)
-            t1e, _,  _ = net1e(images)
-            t2e, _,  _ = net2e(images)
-            #之后可以修改为不使用temperature，比较一下效果
-            soft1 = torch.sigmoid(t1 / temperature)
-            soft2 = torch.sigmoid(t2 / temperature)
-            soft1e = torch.sigmoid(t1e / temperature)
-            soft2e = torch.sigmoid(t2e / temperature)
-            
-            soft1_comb = (soft1 + soft1e) / 2.0
-            soft2_comb = (soft2 + soft2e) / 2.0
-
         with torch.cuda.amp.autocast(enabled=args.amp):
             z1, _,  _ = net1(images)
             z2, _,  _ = net2(images)
             
-            # # 使用 BCE 计算 Hard Loss，保持维度 [Batch, 14]，并用 batch_mask 屏蔽掉脏标签
-            # hard1 = F.binary_cross_entropy_with_logits(z1, targets.float(), reduction='none')
-            # hard2 = F.binary_cross_entropy_with_logits(z2, targets.float(), reduction='none')
-            # soft1_loss = F.binary_cross_entropy_with_logits(z1 / temperature, soft2_comb, reduction='none') * (temperature ** 2)
-            # soft2_loss = F.binary_cross_entropy_with_logits(z2 / temperature, soft1_comb, reduction='none') * (temperature ** 2)
-            # # 聚合总 Loss，只对 Mask=1 的干净标签求均值
-            # loss1 = ((hard1 + alpha * soft1_loss) * batch_mask).sum() / max(1.0, batch_mask.sum().item())
-            # loss2 = ((hard2 + alpha * soft2_loss) * batch_mask).sum() / max(1.0, batch_mask.sum().item())
+            with torch.no_grad():
+                z1e, _,  _ = net1e(images)
+                z2e, _,  _ = net2e(images)
 
-
-
-            # ==========================================================
-            # 1. Hard Loss 区域：使用 ASL + Hack Mask (对抗标签不平衡)
-            # ==========================================================
+            # 互蒸馏使用 detach() 断开梯度，防止计算图纠缠
+            soft1 = torch.sigmoid(z1.detach() / temperature)
+            soft2 = torch.sigmoid(z2.detach() / temperature)
+            soft1e = torch.sigmoid(z1e / temperature)
+            soft2e = torch.sigmoid(z2e / temperature)
+            
+            soft1_comb = (soft1 + soft1e) / 2.0
+            soft2_comb = (soft2 + soft2e) / 2.0
+        
             masked_z1 = z1.clone()
             masked_z2 = z2.clone()
             
@@ -218,14 +206,23 @@ def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, 
 
         opt1.zero_grad()
         scaler.scale(loss1).backward()
+        scaler.unscale_(opt1)
+        torch.nn.utils.clip_grad_norm_(net1.parameters(), max_norm=0.1) # Q2L 必备
         scaler.step(opt1)
         ema1.step()
 
         opt2.zero_grad()
         scaler.scale(loss2).backward()
+        scaler.unscale_(opt2)
+        torch.nn.utils.clip_grad_norm_(net2.parameters(), max_norm=0.1) # Q2L 必备
         scaler.step(opt2)
         ema2.step()
+
         scaler.update()
+
+        # 👇 --- 新增：在这里按 Batch 更新学习率 --- 👇
+        sch1.step()
+        sch2.step()
 @torch.inference_mode()
 def update_fkl_mask(models, loader, device, fkl_consecutive_counts, fkl_mask, consecutive_epochs_required):
     """
@@ -236,7 +233,7 @@ def update_fkl_mask(models, loader, device, fkl_consecutive_counts, fkl_mask, co
         indices = indices.to(device, non_blocking=True)
         
         logits = ensemble_logits(models, x)
-        preds = (torch.sigmoid(logits) > 0.35).float()
+        preds = (torch.sigmoid(logits) > 0.5).float()
         
         # ==========================================================
         # 🌟 核心修改：只统计原本标注为 1 的正标签
@@ -346,7 +343,7 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
             
             for (c_idx, global_i) in c_list:
                 # 1. 计算置信度 (偏离 0.5 的程度)
-                conf_arr[global_i] = torch.abs(probs[b, c_idx] - 0.35).detach()
+                conf_arr[global_i] = torch.abs(probs[b, c_idx] - 0.5).detach()
                 
                 # 2. 核心修复：计算特定标签 Loss 对输入图片 x 的梯度范数
                 loss_c = F.binary_cross_entropy_with_logits(logits[b:b+1, c_idx], targets[b:b+1, c_idx].float())
@@ -494,8 +491,30 @@ def main():
         models = (net1, net2, ema1.ema_model, ema2.ema_model)
 
         opt1, opt2 = build_dual_optimizers(net1, net2, args)
-        sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=args.epochs, eta_min=1e-5)
-        sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=args.epochs, eta_min=1e-5)
+        # ================= 修改开始 =================
+        # 1. 提取各个参数组的学习率
+        found_lrs1 = [group['lr'] for group in opt1.param_groups]
+        found_lrs2 = [group['lr'] for group in opt2.param_groups]
+
+        # 2. 初始化 OneCycleLR
+        # pct_start=0.1 表示前 10% 的训练步数用于 Warmup（学习率从极小值上升到设定值）
+        sch1 = torch.optim.lr_scheduler.OneCycleLR(
+            opt1, 
+            max_lr=found_lrs1, 
+            steps_per_epoch=len(train_loader), 
+            epochs=args.epochs, 
+            pct_start=0.2 
+        )
+        sch2 = torch.optim.lr_scheduler.OneCycleLR(
+            opt2, 
+            max_lr=found_lrs2, 
+            steps_per_epoch=len(train_loader), 
+            epochs=args.epochs, 
+            pct_start=0.2
+        )
+        # ================= 修改结束 =================
+        # sch1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=args.epochs, eta_min=1e-5)
+        # sch2 = torch.optim.lr_scheduler.CosineAnnealingLR(opt2, T_max=args.epochs, eta_min=1e-5)
         # ================= 关键修改：每轮重置 FkL 统计矩阵 =================
         # 因为网络重置了，连续正确预测的次数也必须重新从 0 开始计算
         fkl_consecutive_counts = torch.zeros((num_train_samples, args.num_class), dtype=torch.int32).to(device)
@@ -504,9 +523,9 @@ def main():
             logger.info(f"\n[Round {round_num}/{num_rounds}] Epoch {epoch + 1}/{args.epochs}")
             
             # 1. 训练一个 Epoch (现在正确传入了 global_label_mask)
-            train_one_epoch_mutual_kd(net1, net2, ema1.ema_model, ema2.ema_model, ema1, ema2, opt1, opt2, train_loader, criterion, args, device, global_label_mask)
-            sch1.step()
-            sch2.step()
+            train_one_epoch_mutual_kd(net1, net2, ema1.ema_model, ema2.ema_model, ema1, ema2, opt1, opt2, train_loader, criterion, args, device, global_label_mask,sch1,sch2)
+            # sch1.step()
+            # sch2.step()
             # ================== 🌟 直接调用 Meter 验证并保存最佳权重 ==================
             val_metrics = validate_with_meter(models, val_loader, device)
             

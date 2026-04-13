@@ -103,7 +103,7 @@ class Qeruy2Label(nn.Module):
         src_proj = self.input_proj(src)
 
         # 3. --- 路径 A: Transformer 分支 ---
-        # 如果 pos 为 None (例如 Stage 2 换上了标准 CNN Backbone)，则直接跳过 Transformer 分支计算以节省显存和算力
+        # 如果 pos 为 None
         if pos is not None:
             # 【修改点】：接收 transformer 传出来的 attn_weights
             hs, memory, attn_weights = self.transformer(src_proj, query_embed, pos, mask)
