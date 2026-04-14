@@ -23,58 +23,38 @@ class model(nn.Module):
         fea_gp = self.glb_pooling(feas).flatten(1)  # bs, C
         preds = self.cls(fea_gp)
 
-        if self.training and args is not None:  ## split feature maps
-            if 'flag' in args and 'mix_ind' in args['flag']:
-                mix_ind, mix_dict = args['flag']['mix_ind'], args['flag']['mix_dict']
-                feas_r, preds_r = feas[(1 - mix_ind).bool()], preds[(1 - mix_ind).bool()]
-                feas_m, _ = feas[mix_ind.bool()], preds[mix_ind.bool()]
-                bs_m, C, h, w = feas_m.shape
+        if self.training:  ## split feature maps
+            mix_ind, mix_dict = args['flag']['mix_ind'], args['flag']['mix_dict']
+            feas_r, preds_r = feas[(1 - mix_ind).bool()], preds[(1 - mix_ind).bool()]
+            feas_m, _ = feas[mix_ind.bool()], preds[mix_ind.bool()]
+            bs_m, C, h, w = feas_m.shape
 
-                ng_list = []
-                preds_m = preds_m_r = torch.tensor([], device=inputs.device)
-                for i, (rand_ind, g_row, g_col, n_drop, drop_ind) in enumerate(zip(mix_dict['rand_inds'], mix_dict['rows'], mix_dict['cols'], mix_dict['n_drops'], mix_dict['drop_inds'])):  # insertion ordered in Dict after python 3.6 -> better code to be done
-                    ng = len(rand_ind) // (g_row * g_col)
-                    fea_m = feas_m[sum(ng_list): sum(ng_list) + ng]
-                    ng_list.append(ng)
-                    # fea_r, tgt_r = feas_r[rand_ind], None
-                    if h % g_row + w % g_col != 0:
-                        fea_m = F.interpolate(fea_m, (h // g_row * g_row, w // g_col * g_col), mode='bilinear', align_corners=True)
-                    chunks = [c.split(fea_m.shape[-1] // g_col, dim=-1) for c in fea_m.split(fea_m.shape[-2] // g_row, dim=-2)]  # [[[]\in{ng, C, h//g_row(h'), w//g_col(w')},[],...](sub-imgs in row 1), [[],[],...](sub-imgs in row 2), ...]
-                    fea_m = torch.stack([torch.stack(c, dim=1) for c in chunks], dim=1)  # ng, g_row, g_col, C, h', w' || stack in cols per row, then stack in rows
-                    fea_m = fea_m.view(-1, C, fea_m.shape[-2], fea_m.shape[-1])  # ng, C, h, w
+            ng_list = []
+            preds_m = preds_m_r = torch.tensor([], device=inputs.device)
+            for i, (rand_ind, g_row, g_col, n_drop, drop_ind) in enumerate(zip(mix_dict['rand_inds'], mix_dict['rows'], mix_dict['cols'], mix_dict['n_drops'], mix_dict['drop_inds'])):  # insertion ordered in Dict after python 3.6 -> better code to be done
+                ng = len(rand_ind) // (g_row * g_col)
+                fea_m = feas_m[sum(ng_list): sum(ng_list) + ng]
+                ng_list.append(ng)
+                # fea_r, tgt_r = feas_r[rand_ind], None
+                if h % g_row + w % g_col != 0:
+                    fea_m = F.interpolate(fea_m, (h // g_row * g_row, w // g_col * g_col), mode='bilinear', align_corners=True)
+                chunks = [c.split(fea_m.shape[-1] // g_col, dim=-1) for c in fea_m.split(fea_m.shape[-2] // g_row, dim=-2)]  # [[[]\in{ng, C, h//g_row(h'), w//g_col(w')},[],...](sub-imgs in row 1), [[],[],...](sub-imgs in row 2), ...]
+                fea_m = torch.stack([torch.stack(c, dim=1) for c in chunks], dim=1)  # ng, g_row, g_col, C, h', w' || stack in cols per row, then stack in rows
+                fea_m = fea_m.view(-1, C, fea_m.shape[-2], fea_m.shape[-1])  # ng, C, h, w
 
-                    # pred_m_r = preds_r[rand_ind] * (1 - drop_ind[:, None]) if n_drop > 0 else preds_r[rand_ind]
-                    pred_m_r = torch.masked_fill(preds_r[rand_ind], drop_ind[:, None]==1, -1e3)
+                # pred_m_r = preds_r[rand_ind] * (1 - drop_ind[:, None]) if n_drop > 0 else preds_r[rand_ind]
+                pred_m_r = torch.masked_fill(preds_r[rand_ind], drop_ind[:, None]==1, -1e3)
 
 
-                    fea_m_gp = self.glb_pooling(fea_m).flatten(1)
-                    pred_m = self.cls(fea_m_gp)
-                    pred_m = torch.masked_fill(pred_m, drop_ind[:, None]==1, -1e3)
+                fea_m_gp = self.glb_pooling(fea_m).flatten(1)
+                pred_m = self.cls(fea_m_gp)
+                pred_m = torch.masked_fill(pred_m, drop_ind[:, None]==1, -1e3)
 
-                    preds_m = torch.cat((preds_m, pred_m), dim=0)
-                    preds_m_r = torch.cat((preds_m_r, pred_m_r), dim=0)
+                preds_m = torch.cat((preds_m, pred_m), dim=0)
+                preds_m_r = torch.cat((preds_m_r, pred_m_r), dim=0)
 
-                preds = (preds, preds_m, preds_m_r)
-                # return preds[:(1 - mix_ind).sum()], ...
-            # ==== 新轨道（噪声样本，基于 CAM 图像融合，提取局部 Patch 预测）====
-            elif args.get('return_patches', False):
-                bs_f, C_f, h_f, w_f = feas.shape
-                h2, w2 = h_f // 2, w_f // 2
-                
-                # 将特征图精确地等分为 4 块 (2x2)
-                fea_TL = feas[:, :, :h2, :w2]
-                fea_TR = feas[:, :, :h2, w2:]
-                fea_BL = feas[:, :, h2:, :w2]
-                fea_BR = feas[:, :, h2:, w2:]
-                
-                preds_patches = []
-                for patch in [fea_TL, fea_TR, fea_BL, fea_BR]:
-                    patch_gp = self.glb_pooling(patch).flatten(1)
-                    preds_patches.append(self.cls(patch_gp))
-                
-                # preds_patches: (B, 4, num_classes)
-                preds_patches = torch.stack(preds_patches, dim=1)
-                preds = (preds, preds_patches)
+            preds = (preds, preds_m, preds_m_r)
+            # return preds[:(1 - mix_ind).sum()], ...
         return preds
 
 
@@ -96,8 +76,7 @@ class Loss_fn(loss_fns.BCELoss):
         self.bce = self.loss_fn
 
     def forward(self, inputs, targets):
-        # 【修复】：增加 isinstance 判断，严格确保它是 Tuple
-        if isinstance(inputs, tuple) and len(inputs) == 3:
+        if len(inputs) == 3:
             preds, preds_m, preds_m_r = inputs
             loss_bce = self.bce(preds, targets)
             if targets.shape[-1] == 20:  # for VOC2007

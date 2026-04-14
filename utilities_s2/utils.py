@@ -129,9 +129,7 @@ def get_dataset(args):
         if not args.is_train:
             print(f"!!! [Evaluation Mode] Loading TEST dataset for NIH-CHEST !!!")
         test_set = data_dict[args.data_set](data_dir, mode=eval_mode, transform=test_transfm)
-        train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm,clean_idx_path=getattr(args, 'clean_idx_path', None),
-            noisy_idx_path=getattr(args, 'noisy_idx_path', None),
-            cam_mask_path=getattr(args, 'cam_mask_path', None))
+        train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
     
     # --- MODIFIED: 合并了 MIMIC 和 CHEXPERT 的逻辑
     elif args.data_set in ('MIMIC'):
@@ -140,9 +138,7 @@ def get_dataset(args):
         if not args.is_train:
             print(f"!!! [Evaluation Mode] Loading TEST dataset for NIH-CHEST !!!")
         test_set = data_dict[args.data_set](data_dir, mode=eval_mode, transform=test_transfm)
-        train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm,clean_idx_path=getattr(args, 'clean_idx_path', None),
-            noisy_idx_path=getattr(args, 'noisy_idx_path', None),
-            cam_mask_path=getattr(args, 'cam_mask_path', None))
+        train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
     else:
         raise ValueError(f"未知的数据集: {args.data_set}")
 

@@ -21,8 +21,8 @@ class mimic(Dataset):
         'Fracture', 'Pleural other'
     ]
     num_labels = len(classes) # 13
-    def __init__(self, root='', mode='train', transform=None,
-                 clean_idx_path=None, noisy_idx_path=None, cam_mask_path=None):
+
+    def __init__(self, root='', mode='train', transform=None):
         """
         :param root: 数据集的根目录，例如 /data/mimic_cxr/PA
         :param mode: 'train', 'valid', 或 'test'
@@ -62,34 +62,11 @@ class mimic(Dataset):
         self.y = df[self.classes].values.astype(np.float32)
 
         print(f"=> [{mode}] 成功加载 {len(self.x)} 条样本。")
-        # ================= 新增：加载 Stage 1 产出的信息 =================
-        self.is_clean_array = np.ones(len(self.x), dtype=bool) # 默认全干净
-        self.cam_masks_dict = {}
-        self.noise_clean_labels_dict = {} # 【补齐】初始化纯净标签字典
-
-        if mode == 'train' and clean_idx_path and noisy_idx_path:
-            print(f"=> 加载干净与噪声索引...")
-            clean_indices = torch.load(clean_idx_path)
-            noisy_indices = torch.load(noisy_idx_path)
-            
-            # 将噪声样本标记为 False
-            self.is_clean_array[noisy_indices] = False
-            
-            base_dir = os.path.dirname(clean_idx_path)
-            
-            # 【补齐】加载纯净标签字典
-            labels_pt = os.path.join(base_dir, 'noise_clean_labels_dict.pt')
-            if os.path.exists(labels_pt):
-                self.noise_clean_labels_dict = torch.load(labels_pt)
-            
-            if cam_mask_path and os.path.exists(cam_mask_path):
-                print(f"=> 加载 CAM Masks...")
-                self.cam_masks_dict = torch.load(cam_mask_path)
-        # ==============================================================
+        
         # 校验一下
         if self.y.shape[1] != self.num_labels:
              print(f"警告: CSV 中的列数 ({self.y.shape[1]}) 与代码定义的类别数 ({self.num_labels}) 不匹配！")
-        
+
     def get_number_classes(self):
         return self.num_labels
 
@@ -129,32 +106,9 @@ class mimic(Dataset):
             if self.transform:
                 image = self.transform(image)
             
-            # ================= 新增：吐出双轨所需的信息 =================
-            is_clean = self.is_clean_array[idx]
-            target = torch.tensor(label, dtype=torch.float32) # 【补齐】转为 Tensor
-            
-            # 如果是噪声样本，获取它的 CAM mask 和提纯标签；否则给个默认的占位符
-            if not is_clean:
-                cam_mask = self.cam_masks_dict.get(idx, torch.zeros((2, 2), dtype=torch.bool))
-                
-                # 【补齐】将 target 中被 Stage 1 鉴定为假阳性的标签强行置为 0
-                if idx in self.noise_clean_labels_dict:
-                    clean_label = self.noise_clean_labels_dict[idx]
-                    if isinstance(clean_label, torch.Tensor):
-                        clean_label = clean_label.cpu()
-                    target = target * (clean_label > 0.5).float()
-            else:
-                cam_mask = torch.ones((2, 2), dtype=torch.bool)
-                
-            data = {
-                'image': image, 
-                'target': target, # <--- 现在这里输出的是提纯后的绝对干净标签
-                'name': os.path.basename(filename_record),
-                'is_clean': is_clean,       
-                'cam_mask': cam_mask        
-            }
+            # 返回 engine.py 需要的字典格式
+            data = {'image': image, 'target': label, 'name': os.path.basename(filename_record)}
             return data
-            # ==============================================================
         
         except Exception as e:
             print(f"加载图像出错 {img_path}: {e}")

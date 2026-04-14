@@ -6,43 +6,6 @@ from utilities_s2 import utils, metric, utils_ddp, warmup, logger
 from SpliceMix import SpliceMix
 import models_s2 as models
 from models_s2.SpliceMix_CL import Loss_fn
-# ================= 新增：引入 CAM 模块 =================
-from models_s2.cam_splicemix import CAMSpliceMixer_MixedLabel
-from models_s2.loss_fns import Loss_fn_CAM
-# =======================================================
-import torch.nn.functional as F
-
-def _compute_consistency_loss(outputs_origin, outputs_syn, tgt_mask, weight=1.0, temperature=2.0):
-    """
-    【一致性学习Loss】(BCE 软标签蒸馏版)
-    
-    在干净标签位置上，拼接后的预测概率分布应该与原始预测保持一致
-    
-    Args:
-        outputs_origin: (B_n, num_classes) - 原始图像的预测 (Logits)
-        outputs_syn: (B_n, num_classes) - 拼接后图像的预测 (Logits)
-        tgt_mask: (B_n, num_classes) - 干净标签掩码（0/1）
-        weight: 一致性损失权重
-    """
-    # 1. 将原始图像的 Logits 转换为概率，并作为固定的软标签 (切断梯度)
-    soft_targets = torch.sigmoid(outputs_origin).detach()
-    
-    # 2. 计算拼接后预测与软标签之间的 BCE Loss
-    # 注意：必须使用 reduction='none' 以便后续应用掩码
-    bce_loss_matrix = F.binary_cross_entropy_with_logits(
-        outputs_syn, 
-        soft_targets, 
-        reduction='none'
-    )
-    # 乘以温度的平方补偿梯度缩放
-    bce_loss_matrix = bce_loss_matrix * (temperature ** 2)
-    # 3. 应用掩码：只在干净标签 (tgt_mask == 1) 的位置计算一致性
-    masked_bce = bce_loss_matrix * tgt_mask
-    
-    # 4. 求有效位置的平均 Loss
-    loss_consistency = masked_bce.sum() / (tgt_mask.sum() + 1e-8)
-    
-    return loss_consistency * weight
 class Engine(object):
     def __init__(self, args):
         super(Engine, self).__init__()
@@ -76,17 +39,11 @@ class Engine(object):
         self.scaler = GradScaler(enabled=not self.args.disable_amp)
 
         args = {}
+        #getattr动态获取模块
         self.model = getattr(models, self.args.model).model(self.args.num_classes, args=args).to(self.rank)
         self.optimizer = utils.get_optimizer(self.args, self.model)
         self.loss_fn = getattr(models, self.args.model).Loss_fn().to(self.rank)
-        # ================= 新增：初始化双轨制所需组件 =================
-        # ✨ 使用版本3混合标签模式
-        self.cam_mixer = CAMSpliceMixer_MixedLabel(
-            use_new_labels=True,        # 融合借用样本的新病灶
-            new_label_weight=1.0        # 完全融合（1.0）或概率融合（0.5）
-        )
-        self.criterion_cam = Loss_fn_CAM().to(self.rank)
-        # =============================================================
+        
         self.train_loader, self.test_loader = utils.get_dataloader(train_set=self.dataset['train'],
                                                        test_set=self.dataset['test'], args=self.args)
         if self.args.warmup_epochs > 0:
@@ -114,120 +71,10 @@ class Engine(object):
             torch.cuda.empty_cache()
 
             for i, data in enumerate(train_loader):
-                # 1. 解析 Batch 数据
-                inputs, targets, targets_gt, file_name, is_clean, cam_masks = self.on_start_batch(data)
-                self.optimizer.zero_grad()
-                total_loss = torch.tensor(0.0, device=self.rank)
-                
-                clean_mask = is_clean.bool()
-                noisy_mask = ~clean_mask
-                
-                # 准备一个空 tensor，用于组装整个 batch 的 output 传给 on_end_batch 统计指标
-                outputs_all = torch.zeros((inputs.size(0), self.args.num_classes), device=self.rank)
+                inputs, targets, targets_gt, file_name = self.on_start_batch(data)
+                outputs, loss = self.on_forward(inputs, targets, file_name, is_train=True)
+                self.on_end_batch(outputs, targets_gt.data, loss.data, file_name)
 
-                # =========================================================
-                # 轨道一：干净样本 (保留原版的 SpliceMix 数据增强逻辑)
-                # =========================================================
-                if clean_mask.sum() > 0:
-                    img_c = inputs[clean_mask]
-                    tgt_c = targets[clean_mask]
-                    
-                    with autocast(enabled=not self.args.disable_amp):
-                        args_model = {}
-                        # 完美复刻原版的干净样本前向逻辑
-                        if 'SpliceMix' in self.args.mixer:
-                            img_c, tgt_c, flag = self.mixer(img_c, tgt_c)
-                            if self.args.model in ['SpliceMix_CL']: 
-                                args_model = {'flag': flag}
-                        
-                        outputs_c = self.model(img_c, args_model)
-                        loss_clean = self.loss_fn(outputs_c, tgt_c)
-                        
-                        # 解析输出并截取对应原始 batch_size 的部分（适应 Tuple 输出）
-                        out_c_flat = outputs_c[0] if isinstance(outputs_c, tuple) else outputs_c
-                        out_c_flat = out_c_flat[:clean_mask.sum()]
-                        
-                    weight_c = clean_mask.sum().float() / inputs.size(0)
-                    total_loss += loss_clean * weight_c
-                    outputs_all[clean_mask] = out_c_flat.data.float()
-
-                # =========================================================
-                # 轨道二：噪声样本 (触发 CAM 拼接和局部对齐约束)
-                # =========================================================
-                # 修改后的代码（Line 120-155）
-
-                if noisy_mask.sum() > 0:
-                    img_n = inputs[noisy_mask]
-                    tgt_n = targets[noisy_mask]
-                    mask_n = cam_masks[noisy_mask]
-                    
-                    # ✨ 【新增】获取干净样本池
-                    clean_imgs = inputs[clean_mask] if clean_mask.sum() > 0 else None
-                    clean_tgts = targets[clean_mask] if clean_mask.sum() > 0 else None
-                    clean_masks_data = cam_masks[clean_mask] if clean_mask.sum() > 0 else None
-                    
-                    # 1. 无梯度前向，拿到【原始噪声图像】的预测（��于一致性对比）
-                    with torch.no_grad():
-                        with autocast(enabled=not self.args.disable_amp):
-                            unwrapped_model = self.model.module if hasattr(self.model, 'module') else self.model
-                            # ✨ 【关键】保存原始图像的预测（用于一致性学习）
-                            outputs_origin_n = unwrapped_model(img_n)
-                            outputs_origin_n = outputs_origin_n[0] if isinstance(outputs_origin_n, tuple) else outputs_origin_n
-                    
-                    # 2. 物理图块拼接 (CAM Splicemix - V3)
-                    X_syn, Y_syn, source_grid = self.cam_mixer(
-                        img_n, tgt_n, mask_n,
-                        clean_imgs, clean_tgts, clean_masks_data
-                    )
-                    
-                    # 3. 动态计算 Loss
-                    with autocast(enabled=not self.args.disable_amp):
-                        if self.args.model == 'SpliceMix_CL':
-                            # 【SpliceMix-CL 分支】
-                            outputs_n_overall = self.model(X_syn)
-                            out_n_flat = outputs_n_overall[0] if isinstance(outputs_n_overall, tuple) else outputs_n_overall
-                            
-                            # ✨ 【Loss 1】基础Loss：拼接后图像与拼接后标签
-                            loss_noisy_base = self.loss_fn(outputs_n_overall, Y_syn)
-                            
-                            # ✨ 【Loss 2】一致性学习Loss：拼接后预测与原始预测在干净标签上的一致性
-                            loss_consistency = _compute_consistency_loss(
-                                outputs_origin_n,      # 原始图像预测
-                                out_n_flat,            # 拼接后图像预测
-                                tgt_n                  # 原始干净标签（掩码）
-                            )
-                            
-                            # 【双重 Loss】
-                            loss_noisy = loss_noisy_base + loss_consistency
-                        else:
-                            # 【普通 SpliceMix 分支】：只计算基础 Loss
-                            outputs_n_overall = self.model(X_syn)
-                            out_n_flat = outputs_n_overall[0] if isinstance(outputs_n_overall, tuple) else outputs_n_overall
-                            loss_noisy_base = self.loss_fn(outputs_n_overall, Y_syn)
-                            loss_noisy = loss_noisy_base
-                    
-                    # 4. 梯度加权聚合与输出追踪
-                    weight_n = noisy_mask.sum().float() / inputs.size(0)
-                    total_loss += loss_noisy * weight_n
-                    
-                    outputs_all[noisy_mask] = out_n_flat.data
-                
-                # =========================================================
-                # 梯度的统一反向传播与状态更新
-                # =========================================================
-                if isinstance(total_loss, torch.Tensor) and total_loss.item() > 0:
-                    self.scaler.scale(total_loss).backward()
-                    if self.args.disable_amp:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                
-                if self.args.warmup_epochs > 0 and self.epoch <= self.args.warmup_epochs:
-                    self.warmup_scheduler.step()
-
-                # 将分离的 out_c 和 out_n 完美拼接，传递给评测代码
-                safe_loss = total_loss.detach()
-                self.on_end_batch(outputs_all, targets_gt.data, safe_loss, file_name)
             self.on_end_epoch(is_train=True, result=self.result['train'])
             self.lr_scheduler.step()
 
@@ -242,20 +89,36 @@ class Engine(object):
         self.on_start_epoch(epoch)
         
         for i, data in enumerate(val_loader):
-            # 验证阶段不触发双轨，老老实实走原来的方法
-            inputs, targets, targets_gt, file_name, _, _ = self.on_start_batch(data)
+            inputs, targets, targets_gt, file_name = self.on_start_batch(data)
             outputs, loss = self.on_forward(inputs, targets, file_name, is_train=False)
             self.on_end_batch(outputs, targets_gt.data, loss.data, file_name)
 
         self.on_end_epoch(is_train=False, result=self.result['val'], result_best=self.result['val_best'])
 
     def on_forward(self, inputs, targets, file_name, is_train):
-        # 训练过程的 forward 已经在 train() 中展开，这里只剩下验证时的干净前向逻辑
-        args_model = {}
-        with torch.no_grad():
+        args = {}
+        if is_train:
             with autocast(enabled=not self.args.disable_amp):
-                outputs = self.model(inputs, args_model)
+                if 'SpliceMix' in self.args.mixer:
+                    inputs, targets, flag = self.mixer(inputs, targets)
+                if self.args.model in ['SpliceMix_CL']: args = {'flag': flag,}
+                outputs = self.model(inputs, args)
                 loss = self.loss_fn(outputs, targets)
+
+            self.optimizer.zero_grad()
+            self.scaler.scale(loss).backward()
+            if self.args.disable_amp:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            if self.args.warmup_epochs > 0 and self.epoch <= self.args.warmup_epochs:
+                self.warmup_scheduler.step()
+        else:
+            with torch.no_grad():
+                with autocast(enabled=not self.args.disable_amp):
+                    outputs = self.model(inputs, args)
+                    loss = self.loss_fn(outputs, targets)
 
         outputs = outputs[0][:inputs.shape[0]].data if type(outputs) == tuple else outputs[:inputs.shape[0]].data
         return outputs, loss
@@ -265,15 +128,10 @@ class Engine(object):
         targets_gt = data['target']
         file_name = data['name']
         targets = targets_gt.clone().to(self.rank)
+        #将标注为-1的不确定是否存在的标签强制转换为0，视为样本上没有该标签
         targets[targets == -1] = 0
-        
-        # ================= 【新增】：以字典安全 get 方式提取双轨标志 =================
-        # 这样即使您之后更换验证集或其他没有传这两个字段的 Dataset，也不会报错
-        #data.get('is_clean', torch.ones(inputs.size(0), dtype=torch.bool))   data中有key为'is_clean'则返回对应的值，否则返回全 True 的布尔张量（默认全是干净样本）
-        is_clean = data.get('is_clean', torch.ones(inputs.size(0), dtype=torch.bool)).to(self.rank)
-        cam_masks = data.get('cam_mask', torch.ones((inputs.size(0), 2, 2), dtype=torch.bool)).to(self.rank)
-        # ============================================================================
-        return inputs, targets, targets_gt, file_name, is_clean, cam_masks
+        return inputs, targets, targets_gt, file_name
+
     def on_end_batch(self, outputs, targets_gt, loss, image_name=''):
         bs = self.args.batch_size
         if self.args.distributed:
@@ -328,41 +186,36 @@ class Engine(object):
         str_metrics = ""
         if not is_train and 'mAUC' in metrics_res:
             str_metrics = (
-                # [修改]：在全局指标中加入 meanACC
-                f"mAUC: {metrics_res['mAUC']:.4f}, meanACC: {metrics_res.get('mean_ACC', 0.0):.4f}, "
+                f"mAUC: {metrics_res['mAUC']:.4f}, "
                 f"miF1: {metrics_res['micro_F1']:.4f}, maF1: {metrics_res['macro_F1']:.4f}, "
                 f"miP: {metrics_res['micro_P']:.4f}, maP: {metrics_res['macro_P']:.4f}, "
                 f"miR: {metrics_res['micro_R']:.4f}, maR: {metrics_res['macro_R']:.4f}"
             )
-            # --- [修改]：提取并打印每个具体疾病类别的 AUROC 和 ACC ---
+            # --- 新增：提取并打印每个具体疾病类别的 AUROC ---
             if 'auc_list' in metrics_res:
                 auc_list = metrics_res['auc_list']
-                class_acc_list = metrics_res.get('class_ACC', []) # 获取刚才算出来的各类别 ACC
-                
                 # 从 dataset 中获取疾病名称列表，做好容错处理
                 if hasattr(self.dataset['test'], 'classes'):
                     class_names = self.dataset['test'].classes
                 else:
                     class_names = [f"Class_{i}" for i in range(len(auc_list))]
                 
-                # 将疾病名称与对应的 AUC、ACC 拼接成字符串
+                # 将疾病名称与对应的 AUC 拼接成字符串
                 per_class_str = ", ".join([
-                    f"{name}: (AUC:{auc:.4f} | ACC:{acc:.4f})" if auc != -1.0 else f"{name}: (AUC:N/A | ACC:{acc:.4f})" 
-                    for name, auc, acc in zip(class_names, auc_list, class_acc_list)
+                    f"{name}: {auc:.4f}" if auc != -1.0 else f"{name}: N/A" 
+                    for name, auc in zip(class_names, auc_list)
                 ])
-                # 打印详细的 Per-Class 指标
-                self.logger.info(f"[Per-Class Metrics] {per_class_str}")
+                # 打印详细的 Per-Class AUC
+                self.logger.info(f"[Per-Class AUC] {per_class_str}")
 
-        # ==================== 【关键修复：补回你漏掉的原始日志打印和 Best Model 判定】 ====================
         if is_train:
             str_log = f'[Epoch {self.epoch}, lr{self.lr_curr}] [Train] time:{utils.strftime(self.epoch_time)}s, loss: {loss:.4f} .'
             self.logger.info(str_log)
         else:
-            # 打印包含 meanACC 的全局日志
             str_log = f'[Test] time: {utils.strftime(self.epoch_time)}s, loss: {loss:.4f}, {str_metrics} .'
             self.logger.info(str_log)
 
-            # Best Model 判定 (必须要有这段，否则没法保存最佳权重)
+            # Best Model 判定
             current_mAUC = metrics_res.get('mAUC', 0.0)
             if result_best['mAUC'] < current_mAUC:
                 is_best = True
@@ -373,7 +226,6 @@ class Engine(object):
 
             str_best = f"--[Test-best] (E{result_best['epoch']}), mAUC: {result_best['mAUC']:.4f}"
             self.logger.info(str_best)
-        # =================================================================================================
 
         if self.args.evaluate != 0 and utils_ddp.is_main_process():
             self.save_checkpoint(is_train, is_best)

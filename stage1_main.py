@@ -88,16 +88,16 @@ def parser_args():
     parser.add_argument('--orid_norm', action='store_true', default=False)
 
     # Phase 控制参数
-    parser.add_argument("--i_rate_1", type=int, default=3)
-    parser.add_argument("--i_rate_2", type=int, default=3)
-    parser.add_argument("--i_rate_3", type=int, default=3)
+    parser.add_argument("--i_rate_1", type=int, default=1)
+    parser.add_argument("--i_rate_2", type=int, default=0)
+    parser.add_argument("--i_rate_3", type=int, default=0)
     parser.add_argument("--i_rate_4", type=int, default=0)
     
     # 动态保留比例 (注意：在 MEE 中 remove_rate 其实是 "保留的干净样本比例")
-    parser.add_argument("--remove_rate_1", type=float, default=0.99)
-    parser.add_argument("--remove_rate_2", type=float, default=0.99)
-    parser.add_argument("--remove_rate_3", type=float, default=0.99)
-    parser.add_argument("--remove_rate_4", type=float, default=0.99)
+    parser.add_argument("--remove_rate_1", type=float, default=0.95)
+    parser.add_argument("--remove_rate_2", type=float, default=0.995)
+    parser.add_argument("--remove_rate_3", type=float, default=0.995)
+    parser.add_argument("--remove_rate_4", type=float, default=0.995)
     args = parser.parse_args()
     return args
 
@@ -460,10 +460,6 @@ def main():
     for _, targets, indices in etrain_loader:
         all_targets[indices] = (targets == 1).to(device)
 
-    # 标签级FkL矩阵初始化  冗余代码
-    # fkl_consecutive_counts = torch.zeros((num_train_samples, args.num_class), dtype=torch.int32).to(device)
-    # fkl_mask = torch.zeros((num_train_samples, args.num_class), dtype=torch.bool).to(device)
-
     # === 初始化全局掩码 ===
     # 初始状态下，所有标签都视为“干净”（参与训练）
 
@@ -626,7 +622,7 @@ def main():
                         clean_indices = torch.nonzero(is_clean_sample).squeeze(1).tolist()
                         noisy_indices = torch.nonzero(~is_clean_sample).squeeze(1).tolist()
                         
-                        # 生成噪声样本的干净标签字典，供 Stage 2 CAM 使用
+                        # 生成噪声样本的干净标签字典
                         noise_clean_labels_dict = {}
                         for n_idx in noisy_indices:
                             clean_lbls = torch.nonzero(global_label_mask[n_idx]).squeeze(1).tolist()
@@ -641,7 +637,7 @@ def main():
                         logger.info(f" >>> Stage 1 Split Complete! ")
                         logger.info(f"     * Clean Samples: {len(clean_indices)}")
                         logger.info(f"     * Noisy Samples: {len(noisy_indices)}")
-                        logger.info(" >>> Exiting Stage 1 gracefully to start Stage 2 / CAM scripts. <<<")
+                        logger.info(" >>> Exiting Stage 1 gracefully to start Stage 2  . <<<")
                         logger.info("="*60)
                         
                         sys.stdout.flush() 
