@@ -91,11 +91,30 @@ class SpliceMix(object):
             drop_rand_ind = np.asarray([random.sample(range(i*g, (i+1)*g), n_drop) for i in range(n_grid)]).reshape(-1)
             drop_ind[drop_rand_ind] = 1
             inputs = inputs * (1 - drop_ind[:, None, None, None])
-        inputs = F.interpolate(inputs, (h // g_row, w // g_col), mode='bilinear', align_corners=True)  # g*ng, C, h', w'
-        inputs_mix = torchvision.utils.make_grid(inputs, nrow=g_col, padding=0)  # C, ng*h, w
-        inputs_mix = inputs_mix.split(h//g_row * g_row, dim=1)  # tuple: ng, (C, h, w)
-        inputs_mix = torch.stack(inputs_mix, dim=0)
+        # 1. 下采样特征图
+        h_prime = h // g_row
+        w_prime = w // g_col
+
+        # 这个F.adaptive_max_pool2d可以修改为F.interpolate(inputs, (h // g_row, w // g_col), mode='bilinear', align_corners=True)
+
+        inputs = F.adaptive_max_pool2d(inputs, output_size=(h_prime, w_prime))
+        # inputs = F.interpolate(inputs, (h // g_row, w // g_col), mode='bilinear', align_corners=True)  # g*ng, C, h', w'
+        # inputs_mix = torchvision.utils.make_grid(inputs, nrow=g_col, padding=0)  # C, ng*h, w
+        # inputs_mix = inputs_mix.split(h//g_row * g_row, dim=1)  # tuple: ng, (C, h, w)
+        # inputs_mix = torch.stack(inputs_mix, dim=0)
+        # ---------------- 核心修改点开始 ----------------
+        # 废弃 torchvision.utils.make_grid，改用张量维度重排来实现高维特征网格拼接
         
+        # 将展平的 batch 恢复成网格形状: [n_grid, g_row, g_col, C, h', w']
+        inputs_grid = inputs.view(n_grid, g_row, g_col, c, h_prime, w_prime)
+        
+        # 维度重排: 将物理上需要拼接在一起的维度放在相邻位置
+        # 目标维度顺序: [n_grid, C, g_row, h', g_col, w']
+        inputs_grid = inputs_grid.permute(0, 3, 1, 4, 2, 5).contiguous()
+        
+        # 将空间维度合并，完成真正的特征拼接: [n_grid, C, g_row * h', g_col * w']
+        inputs_mix = inputs_grid.view(n_grid, c, g_row * h_prime, g_col * w_prime)
+        # ---------------- 核心修改点结束 ----------------
         if (inputs_mix.shape[-2], inputs_mix.shape[-1]) != (h, w):
             inputs_mix = F.interpolate(inputs_mix, (h, w), mode='bilinear', align_corners=True)
 
@@ -103,7 +122,6 @@ class SpliceMix(object):
             targets = targets * (1 - drop_ind[:, None])
         targets_mix = targets.view(n_grid, g, -1).sum(1)  # ng, nc
         targets_mix[targets_mix > 0] = 1
-
         return inputs_mix, targets_mix, drop_ind
 
     def Smix_minimalism(self, X, Y):

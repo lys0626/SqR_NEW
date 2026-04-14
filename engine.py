@@ -99,11 +99,25 @@ class Engine(object):
         args = {}
         if is_train:
             with autocast(enabled=not self.args.disable_amp):
-                if 'SpliceMix' in self.args.mixer:
-                    inputs, targets, flag = self.mixer(inputs, targets)
-                if self.args.model in ['SpliceMix_CL']: args = {'flag': flag,}
+                # ---------------- 核心修改：移除外部图片拼接 ----------------
+                # 原代码： inputs, targets, flag = self.mixer(inputs, targets)
+                # 改为将 mixer 和原始 targets 传入模型内部处理
+                
+                if self.args.model in ['SpliceMix_CL']: 
+                    args = {
+                        'mixer': self.mixer,
+                        'targets': targets
+                    }
+                
                 outputs = self.model(inputs, args)
+                # targets_gt 将在 Loss_fn 内部被替换为 targets_all，这里传入原始 targets 仅做占位
                 loss = self.loss_fn(outputs, targets)
+                # --------------------------------------------------------
+                # if 'SpliceMix' in self.args.mixer:
+                #     inputs, targets, flag = self.mixer(inputs, targets)
+                # if self.args.model in ['SpliceMix_CL']: args = {'flag': flag,}
+                # outputs = self.model(inputs, args)
+                # loss = self.loss_fn(outputs, targets)
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
