@@ -1,4 +1,4 @@
-GPU_ID=3
+GPU_ID=0
 # export CUDA_VISIBLE_DEVICES=${GPU_ID}      # 指定使用的单卡 GPU 编号
 
 DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
@@ -9,11 +9,11 @@ DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
 # DATASET_NAME_UPPER="NIH-CHEST"
 # DATA_DIR="/data/nih-chest-xrays"
 
-EXP_DIR="/data/dsj/lys/SqR-NEW/experiment/new_Splicemix_EMA"        # 实验输出的顶层根目录
+EXP_DIR="/data/dsj/lys/SqR-NEW/experiment/4.15_new_Splicemix_EMA"        # 实验输出的顶层根目录
 
 # ================= 2. 方法选择配置 =================
 # 可选值: "splicemix" 或 "splicemix-cl"，或 baseline
-STAGE2_METHOD="splicemix"             
+STAGE2_METHOD="splicemix-cl"             
 NUM_CLASS=13
 STAGE2_OUT="${EXP_DIR}/${DATASET_NAME}/stage2_${STAGE2_METHOD}"
 mkdir -p "${STAGE2_OUT}"

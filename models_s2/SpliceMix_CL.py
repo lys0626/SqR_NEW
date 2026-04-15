@@ -7,7 +7,7 @@ import models_s2.loss_fns as loss_fns
 class model(nn.Module):
     def __init__(self, num_classes, pretrained=True, args=None):
         super(model, self).__init__()
-        M = torchvision.models.resnet101(pretrained=pretrained)
+        M = torchvision.models.resnet50(pretrained=pretrained)
         
         # --- 1. 拆分 Backbone ---
         # Stage 1: 提取浅层特征 (用于拼接操作)

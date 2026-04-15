@@ -174,10 +174,9 @@ class Engine(object):
         if is_train:
             with autocast(enabled=not self.args.disable_amp):
                 # ---------------- 核心修改：移除外部图片拼接 ----------------
-                # 原代码： inputs, targets, flag = self.mixer(inputs, targets)
-                # 改为将 mixer 和原始 targets 传入模型内部处理
-                
-                if self.args.model in ['SpliceMix_CL']: 
+                # --- 修改这里：只要使用了 SpliceMix，就把参数传进去 ---
+                # 这样无论是 ResNet_50 还是 SpliceMix_CL，都能接收到 mixer
+                if 'SpliceMix' in self.args.mixer: 
                     args = {
                         'mixer': self.mixer,
                         'targets': targets
