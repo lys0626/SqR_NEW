@@ -13,6 +13,10 @@ class model(nn.Module):
         # Stage 2: 提取深层特征
         self.stage2 = nn.Sequential(M.layer3, M.layer4)
 
+        # self.stage1 = nn.Sequential(M.conv1, M.bn1, M.relu, M.maxpool, M.layer1)
+        # # # Stage 2: 提取深层特征
+        # self.stage2 = nn.Sequential(M.layer2, M.layer3, M.layer4)
+
         self.num_classes = num_classes
         self.glb_pooling = nn.AdaptiveMaxPool2d((1, 1))
         self.cls = nn.Linear(M.layer4[-1].conv3.out_channels, num_classes)
