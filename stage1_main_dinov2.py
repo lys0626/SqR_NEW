@@ -27,20 +27,26 @@ from lib.models.aslloss import AsymmetricLossOptimized
 class DINOClassifier(nn.Module):
     def __init__(self, num_class, arch='dinov2_vits14'):
         super().__init__()
-        # 自动从 PyTorch Hub 加载预训练的 DINOv2 骨干网络
-        self.backbone = torch.hub.load('facebookresearch/dinov2', arch)
-        
+        # 1. 本地代码路径 (替换为你实际上传的 dinov2 仓库目录)
+        local_repo_path = '/data/dsj/lys/dinov2' 
+        # 2. 本地权重路径 (替换为你实际上传的 .pth 文件路径)
+        local_weight_path = '/data/dsj/lys/dinov2_vits14_pretrain.pth'
+        # ================= 核心离线加载逻辑 =================
+        # source='local' 表示从本地目录读取网络架构代码
+        # pretrained=False 表示只构建空骨架，绝不向外网请求权重！
+        self.backbone = torch.hub.load(local_repo_path, arch, source='local', pretrained=False)
+        # 手动将本地的 .pth 权重文件“塞”进空骨架里
+        state_dict = torch.load(local_weight_path, map_location='cpu')
+        self.backbone.load_state_dict(state_dict)
+        # ====================================================
         # 获取 DINO 的特征维度 (vits14 为 384)
         embed_dim = self.backbone.embed_dim
-        
         # 替换为多标签分类头
         self.fc = nn.Linear(embed_dim, num_class)
-
     def forward(self, x):
         features = self.backbone(x)
         logits = self.fc(features)
         return logits
-
 def build_dino(args):
     # 使用 vits14 版本，对显存较友好
     return DINOClassifier(num_class=args.num_class, arch='dinov2_vits14')
@@ -98,12 +104,12 @@ def parser_args():
     parser.add_argument('--orid_norm', action='store_true', default=False)
 
     # Phase 控制参数
-    parser.add_argument("--i_rate_1", type=int, default=3)
-    parser.add_argument("--i_rate_2", type=int, default=3)
-    parser.add_argument("--i_rate_3", type=int, default=3)
+    parser.add_argument("--i_rate_1", type=int, default=2)
+    parser.add_argument("--i_rate_2", type=int, default=0)
+    parser.add_argument("--i_rate_3", type=int, default=0)
     parser.add_argument("--i_rate_4", type=int, default=0)
     
-    parser.add_argument("--remove_rate_1", type=float, default=0.995)
+    parser.add_argument("--remove_rate_1", type=float, default=0.975)
     parser.add_argument("--remove_rate_2", type=float, default=0.995)
     parser.add_argument("--remove_rate_3", type=float, default=0.995)
     parser.add_argument("--remove_rate_4", type=float, default=0.995)
@@ -519,43 +525,120 @@ def main():
                         logger.info(f"\n>>> [Round {round_num}] Using pure FkL filtering (Whitelist Mode)... <<<")
                         
                         global_label_mask = global_label_mask & (fkl_mask | negative_targets_mask)    
-                    
-                    if round_num == num_rounds:
-                        logger.info(f"\n>>> Final Round {round_num} Reached. Executing Sample-Level Voting & Exiting! <<<")
-                        
-                        total_positives = all_targets.sum(dim=1) 
-                        clean_pos_counts = (global_label_mask & all_targets).sum(dim=1)
-                        noisy_pos_counts = (~global_label_mask & all_targets).sum(dim=1)
-                        
-                        is_clean_sample = torch.zeros(num_train_samples, dtype=torch.bool).to(device)
-                        
-                        has_pos = total_positives > 0
-                        is_clean_sample[has_pos] = clean_pos_counts[has_pos] > noisy_pos_counts[has_pos]
-                        
-                        no_pos = total_positives == 0
-                        is_clean_sample[no_pos] = True
-                        
-                        clean_indices = torch.nonzero(is_clean_sample).squeeze(1).tolist()
-                        noisy_indices = torch.nonzero(~is_clean_sample).squeeze(1).tolist()
-                        
-                        noise_clean_labels_dict = {}
-                        for n_idx in noisy_indices:
-                            clean_lbls = torch.nonzero(global_label_mask[n_idx]).squeeze(1).tolist()
-                            noise_clean_labels_dict[int(n_idx)] = clean_lbls
+                    # 判断是否是最后一轮
 
-                        torch.save(clean_indices, os.path.join(args.output, 'clean_indices.pt'))
-                        torch.save(noisy_indices, os.path.join(args.output, 'noisy_indices.pt'))
-                        torch.save(noise_clean_labels_dict, os.path.join(args.output, 'noise_clean_labels_dict.pt'))
+                    #用于将噪声标签进行修改
+                    if round_num == num_rounds:
+                        logger.info(f"\n>>> Final Round {round_num} Reached. Generating Asymmetric Soft Targets (FP & FN) & Exiting! <<<")
+                        
+                        # ==========================================
+                        # 🌟 关键修复：加载历史最佳权重，防止训练末期性能衰退
+                        # ==========================================
+                        best_ckpt_path = os.path.join(args.output, 'best_stage1_model.pth')
+                        if os.path.exists(best_ckpt_path):
+                            logger.info(f"    -> Loading BEST EMA models from {best_ckpt_path} for Soft Label generation...")
+                            checkpoint = torch.load(best_ckpt_path, map_location=device)
+                            # 将巅峰状态的权重强行覆盖回当前的 EMA 模型
+                            ema1.ema_model.load_state_dict(checkpoint['net1_ema'])
+                            ema2.ema_model.load_state_dict(checkpoint['net2_ema'])
+                            logger.info(f"    -> Successfully restored EMA models to their peak performance (Val mAUC: {checkpoint['best_auroc']:.4f} at Round {checkpoint['round']}, Epoch {checkpoint['epoch']})")
+                        else:
+                            logger.warning("    -> Best checkpoint not found! Using the final epoch's degraded models instead.")
+
+                        # ==========================================
+                        # 0. 准备 ema_preds: 遍历全集，获取双 EMA 模型的平滑预测概率
+                        # ==========================================
+                        ema_preds = torch.zeros((num_train_samples, args.num_class), dtype=torch.float32).to(device)
+                        
+                        ema1.ema_model.eval()
+                        ema2.ema_model.eval()
+                        
+                        logger.info("    -> Inferencing whole dataset with Peak-Performance Dual-EMA models...")
+                        with torch.no_grad():
+                            for images, _, indices in etrain_loader:
+                                images = images.to(device, non_blocking=True)
+                                indices = indices.to(device, non_blocking=True)
+                                
+                                # 取两个 EMA 模型的平均 Logits，并经过 Sigmoid 转化为概率
+                                logits1 = ema1.ema_model(images)
+                                logits2 = ema2.ema_model(images)
+                                probs = torch.sigmoid((logits1 + logits2) / 2.0)
+                                ema_preds[indices] = probs
+
+                        # ==========================================
+                        # 1. 拷贝原始硬标签
+                        # ==========================================
+                        final_soft_targets = all_targets.float().clone()
+
+                        # ==========================================
+                        # 动作 1：处理假阳性 (FP) —— 继承前期的 MEE 成果
+                        # ==========================================
+                        fp_mask = (all_targets == 1) & (~global_label_mask)
+                        final_soft_targets[fp_mask] = ema_preds[fp_mask] 
+
+                        # ==========================================
+                        # 动作 2：挖掘假阴性 (FN) —— 使用巅峰 EMA 绝杀
+                        # ==========================================
+                        fn_mask = (all_targets == 0) & (ema_preds > 0.8)
+                        final_soft_targets[fn_mask] = ema_preds[fn_mask]
+
+                        # 统计数量用于日志展示
+                        fp_count = fp_mask.sum().item()
+                        fn_count = fn_mask.sum().item()
+
+                        # ==========================================
+                        # 保存，传给 Stage 2 训练
+                        # ==========================================
+                        output_path = os.path.join(args.output, 'asymmetric_soft_targets.pt')
+                        torch.save(final_soft_targets, output_path)
                         
                         logger.info("="*60)
-                        logger.info(f" >>> Stage 1 Split Complete! ")
-                        logger.info(f"     * Clean Samples: {len(clean_indices)}")
-                        logger.info(f"     * Noisy Samples: {len(noisy_indices)}")
-                        logger.info(" >>> Exiting Stage 1 gracefully to start Stage 2  . <<<")
+                        logger.info(f" >>> Stage 1 Split Complete (Peak-Performance Asymmetric Soft Correction)! ")
+                        logger.info(f"     * False Positives (FP) Softened: {fp_count}")
+                        logger.info(f"     * False Negatives (FN) Mined:    {fn_count}")
+                        logger.info(f"     * Saved soft targets to: {output_path}")
+                        logger.info(" >>> Exiting Stage 1 gracefully to start Stage 2. <<<")
                         logger.info("="*60)
                         
                         sys.stdout.flush() 
                         sys.exit(0)
+                    # 只处理噪声样本和干净样本的划分，不修改标签
+                    # if round_num == num_rounds:
+                    #     logger.info(f"\n>>> Final Round {round_num} Reached. Executing Sample-Level Voting & Exiting! <<<")
+                        
+                    #     total_positives = all_targets.sum(dim=1) 
+                    #     clean_pos_counts = (global_label_mask & all_targets).sum(dim=1)
+                    #     noisy_pos_counts = (~global_label_mask & all_targets).sum(dim=1)
+                        
+                    #     is_clean_sample = torch.zeros(num_train_samples, dtype=torch.bool).to(device)
+                        
+                    #     has_pos = total_positives > 0
+                    #     is_clean_sample[has_pos] = clean_pos_counts[has_pos] > noisy_pos_counts[has_pos]
+                        
+                    #     no_pos = total_positives == 0
+                    #     is_clean_sample[no_pos] = True
+                        
+                    #     clean_indices = torch.nonzero(is_clean_sample).squeeze(1).tolist()
+                    #     noisy_indices = torch.nonzero(~is_clean_sample).squeeze(1).tolist()
+                        
+                    #     noise_clean_labels_dict = {}
+                    #     for n_idx in noisy_indices:
+                    #         clean_lbls = torch.nonzero(global_label_mask[n_idx]).squeeze(1).tolist()
+                    #         noise_clean_labels_dict[int(n_idx)] = clean_lbls
+
+                    #     torch.save(clean_indices, os.path.join(args.output, 'clean_indices.pt'))
+                    #     torch.save(noisy_indices, os.path.join(args.output, 'noisy_indices.pt'))
+                    #     torch.save(noise_clean_labels_dict, os.path.join(args.output, 'noise_clean_labels_dict.pt'))
+                        
+                    #     logger.info("="*60)
+                    #     logger.info(f" >>> Stage 1 Split Complete! ")
+                    #     logger.info(f"     * Clean Samples: {len(clean_indices)}")
+                    #     logger.info(f"     * Noisy Samples: {len(noisy_indices)}")
+                    #     logger.info(" >>> Exiting Stage 1 gracefully to start Stage 2  . <<<")
+                    #     logger.info("="*60)
+                        
+                    #     sys.stdout.flush() 
+                    #     sys.exit(0)
                     else:
                         logger.info(f">>> Round {round_num} Completed. Breaking inner loop to start Round {round_num + 1}. <<<")
                         break  

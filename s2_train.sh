@@ -18,7 +18,7 @@ NUM_CLASS=13
 STAGE2_OUT="${EXP_DIR}/${DATASET_NAME}/stage2_${STAGE2_METHOD}"
 mkdir -p "${STAGE2_OUT}"
 #指定干净样本的路径
-CLEAN_IDX_PATH="/data/dsj/lys/SqR-old_3_25/experiment/224/3_16_denoise_-2_loss/mimic/stage1_splicemix_q2l/clean_indices.pt"
+CLEAN_IDX_PATH=""
 # 推导模型名称参数与目录名称
 if [ "$STAGE2_METHOD" = "splicemix-cl" ]; then
     MODEL_ARG="SpliceMix_CL"
