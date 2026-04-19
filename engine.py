@@ -8,6 +8,32 @@ import models_s2 as models
 import copy, math
 from models_s2.SpliceMix_CL import Loss_fn
 import numpy as np
+from torch.utils.data import Dataset
+class SoftLabelDatasetWrapper(Dataset):
+    """
+    字典兼容的数据集包装器：
+    将 Stage 1 的软标签注入 data['target'] 供网络训练，
+    同时将原硬标签保留为 data['target_hard'] 供指标监控。
+    """
+    def __init__(self, original_dataset, soft_targets_tensor):
+        self.dataset = original_dataset
+        self.soft_targets = soft_targets_tensor.cpu() # 放在 CPU 防止主进程显存爆炸
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        # 1. 获取原始数据字典
+        data = self.dataset[index]
+        
+        # 2. 保留真实的硬标签用于指标统计（深度拷贝防篡改）
+        if 'target_hard' not in data:
+            data['target_hard'] = data['target'].clone() if torch.is_tensor(data['target']) else data['target']
+        
+        # 3. 将软标签注入 target 键，供网络反向传播
+        data['target'] = self.soft_targets[index].clone()
+        
+        return data
 class ModelEMA:
     """ 
     模型参数的指数移动平均 (Exponential Moving Average)
@@ -62,6 +88,28 @@ class Engine(object):
 
     def init(self):
         train_set, test_set, self.args.num_classes = utils.get_dataset(self.args)
+
+        # ==========================================
+        # 🌟 核心接入：覆盖训练集的 Target 为软标签
+        # ==========================================
+        # 假设在 stage2_main.py 中传入了 --soft_label_path
+        soft_label_path = getattr(self.args, 'soft_label_path', '')
+        
+        #不传入软标签路径，模型会默认采用硬标签
+        if soft_label_path and os.path.exists(soft_label_path):
+            self.logger.info(f" >>> Loading Asymmetric Soft Targets from: {soft_label_path}")
+            
+            soft_targets_tensor = torch.load(soft_label_path, map_location='cpu')
+            
+            # 安全校验：确保软标签数量与训练集长度一致
+            assert soft_targets_tensor.shape[0] == len(train_set), \
+                f"🚨 Error: Soft targets length ({soft_targets_tensor.shape[0]}) mismatch with train_set ({len(train_set)})!"
+            train_set = SoftLabelDatasetWrapper(train_set, soft_targets_tensor)
+            self.logger.info(" >>> 🎯 Successfully wrapped train_set with Stage 1 Soft Labels!")
+        else:
+            self.logger.warning(" !!! No soft labels found. Training with ORIGINAL HARD LABELS !!!")
+        # ==========================================
+
         self.dataset = {'train': train_set, 'test': test_set}
         self.scaler = GradScaler(enabled=not self.args.disable_amp)
 
@@ -214,11 +262,17 @@ class Engine(object):
 
     def on_start_batch(self, data):
         inputs = data['image'].to(self.rank)
-        targets_gt = data['target']
         file_name = data['name']
-        targets = targets_gt.clone().to(self.rank)
-        #将标注为-1的不确定是否存在的标签强制转换为0，视为样本上没有该标签
-        targets[targets == -1] = 0
+        
+        # 1. targets 用于喂给 Loss 计算（被 Wrapper 替换成了软标签）
+        targets = data['target'].clone().to(self.rank)
+        targets[targets == -1] = 0 # 兜底机制，消除未标注数据
+        
+        # 2. targets_gt (Ground Truth) 用于喂给 Meter 计算 mAP 
+        # 如果包装器保存了硬标签，就用硬标签；如果是测试集没被包装，就回退用 target
+        targets_gt = data.get('target_hard', data['target']).clone().to(self.rank)
+        targets_gt[targets_gt == -1] = 0
+        
         return inputs, targets, targets_gt, file_name
 
     def on_end_batch(self, outputs, targets_gt, loss, image_name=''):

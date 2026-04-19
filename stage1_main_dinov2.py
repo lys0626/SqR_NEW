@@ -163,8 +163,12 @@ def ensemble_logits(models, x):
     out1e = net1e(x)
     out2e = net2e(x)
     return (out1 + out2 + out1e + out2e) / 4.0
+import torchvision.transforms as T
 
-def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, loader, criterion, args, device, global_label_mask,sch1,sch2):
+# 在 stage1_main_dinov2.py 文件顶部引入 RandomErasing
+# RandomErasing 是一种极佳的非对称扰动，能强迫模型关注不同的局部病灶区域
+random_erasing = T.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3), value=0)
+def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, loader, criterion, args, device, global_label_mask,sch1,sch2,current_epoch):
     net1.train()
     net2.train()
     net1e.eval()
@@ -178,11 +182,22 @@ def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, 
         indices = indices.to(device, non_blocking=True)
         
         batch_mask = global_label_mask[indices].float()
-
+        # ==========================================
+        # 🌟 修改 2（终极版）：独立随机非对称增强
+        # ==========================================
+        # 分别对两份独立的 clone 数据进行擦除操作。
+        # 因为 p=0.5，这会自动产生 4 种组合，概率各占 25%：
+        # 1. net1 原图，net2 遮挡 (net2 猜 net1)
+        # 2. net1 遮挡，net2 原图 (net1 猜 net2)
+        # 3. net1 遮挡，net2 遮挡 (都在不同位置被遮挡，互相猜)
+        # 4. net1 原图，net2 原图 (标准的原始互学习)
+        
+        images_net1 = random_erasing(images.clone())
+        images_net2 = random_erasing(images.clone())
         with torch.cuda.amp.autocast(enabled=args.amp):
             # ======= 修改：直接接收 logits =======
-            z1 = net1(images)
-            z2 = net2(images)
+            z1 = net1(images_net1)
+            z2 = net2(images_net2)
             
             with torch.no_grad():
                 z1e = net1e(images)
@@ -203,16 +218,21 @@ def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, 
             
             masked_z1[ignore_idx] = 20.0
             masked_z2[ignore_idx] = 20.0
-
-            hard1 = criterion(masked_z1, targets.float())
-            hard2 = criterion(masked_z2, targets.float())
-            
+            #ASL LOSS
+            # hard1 = criterion(masked_z1, targets.float())
+            # hard2 = criterion(masked_z2, targets.float())
+            #DAL LOSS
+            progress_ratio = current_epoch / args.epochs
+            hard1 = criterion(masked_z1, targets.float(), progress_ratio)
+            hard2 = criterion(masked_z2, targets.float(), progress_ratio)
             soft1_loss = F.binary_cross_entropy_with_logits(z1 / temperature, soft2_comb, reduction='none') * (temperature ** 2)
             soft2_loss = F.binary_cross_entropy_with_logits(z2 / temperature, soft1_comb, reduction='none') * (temperature ** 2)
 
-            loss1 = hard1 + alpha * (soft1_loss * batch_mask).sum() / max(1.0, batch_mask.sum().item())
-            loss2 = hard2 + alpha * (soft2_loss * batch_mask).sum() / max(1.0, batch_mask.sum().item())
-
+            # loss1 = hard1 + alpha * (soft1_loss * batch_mask).sum() / max(1.0, batch_mask.sum().item())
+            # loss2 = hard2 + alpha * (soft2_loss * batch_mask).sum() / max(1.0, batch_mask.sum().item())
+            # 让模型在噪声位置也能向双 EMA 老师的共识靠拢，实现隐式纠错,no_mask_EMA
+            loss1 = hard1 + alpha * soft1_loss.mean()
+            loss2 = hard2 + alpha * soft2_loss.mean()
         opt1.zero_grad()
         scaler.scale(loss1).backward()
         scaler.unscale_(opt1)
@@ -408,9 +428,16 @@ def main():
         num_workers=args.workers,
         pin_memory=True  
     )
-    
-    criterion = AsymmetricLossOptimized(gamma_neg=args.gamma_neg, gamma_pos=args.gamma_pos, clip=args.loss_clip, disable_torch_grad_focal_loss=False)
-
+    #ASL loss
+    # criterion = AsymmetricLossOptimized(gamma_neg=args.gamma_neg, gamma_pos=args.gamma_pos, clip=args.loss_clip, disable_torch_grad_focal_loss=False)
+    #D-ASL loss
+    from lib.models.aslloss import DynamicAsymmetricLoss
+    criterion = DynamicAsymmetricLoss(
+        gamma_neg=args.gamma_neg, 
+        gamma_pos=args.gamma_pos, 
+        base_clip=args.loss_clip, 
+        max_clip=0.2  # 您可以根据 NIH 数据集的噪声严重程度微调此值
+    )
     etrain_loader = torch.utils.data.DataLoader(train_dataset_eval, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     num_train_samples = len(train_dataset)
     all_targets = torch.zeros((num_train_samples, args.num_class), dtype=torch.bool).to(device)
@@ -467,7 +494,7 @@ def main():
         for epoch in range(args.epochs):
             logger.info(f"\n[Round {round_num}/{num_rounds}] Epoch {epoch + 1}/{args.epochs}")
             
-            train_one_epoch_mutual_kd(net1, net2, ema1.ema_model, ema2.ema_model, ema1, ema2, opt1, opt2, train_loader, criterion, args, device, global_label_mask,sch1,sch2)
+            train_one_epoch_mutual_kd(net1, net2, ema1.ema_model, ema2.ema_model, ema1, ema2, opt1, opt2, train_loader, criterion, args, device, global_label_mask,sch1,sch2,epoch)
             
             val_metrics = validate_with_meter(models, val_loader, device)
             
@@ -526,7 +553,6 @@ def main():
                         
                         global_label_mask = global_label_mask & (fkl_mask | negative_targets_mask)    
                     # 判断是否是最后一轮
-
                     #用于将噪声标签进行修改
                     if round_num == num_rounds:
                         logger.info(f"\n>>> Final Round {round_num} Reached. Generating Asymmetric Soft Targets (FP & FN) & Exiting! <<<")
@@ -546,9 +572,10 @@ def main():
                             logger.warning("    -> Best checkpoint not found! Using the final epoch's degraded models instead.")
 
                         # ==========================================
-                        # 0. 准备 ema_preds: 遍历全集，获取双 EMA 模型的平滑预测概率
+                        # 0. 准备 ema_preds 和 ema_vars (新增方差矩阵)
                         # ==========================================
                         ema_preds = torch.zeros((num_train_samples, args.num_class), dtype=torch.float32).to(device)
+                        ema_vars = torch.zeros((num_train_samples, args.num_class), dtype=torch.float32).to(device) # 追踪不确定性
                         
                         ema1.ema_model.eval()
                         ema2.ema_model.eval()
@@ -559,30 +586,91 @@ def main():
                                 images = images.to(device, non_blocking=True)
                                 indices = indices.to(device, non_blocking=True)
                                 
-                                # 取两个 EMA 模型的平均 Logits，并经过 Sigmoid 转化为概率
-                                logits1 = ema1.ema_model(images)
-                                logits2 = ema2.ema_model(images)
-                                probs = torch.sigmoid((logits1 + logits2) / 2.0)
-                                ema_preds[indices] = probs
+                                # TTA 1: 原始图像
+                                p1 = torch.sigmoid((ema1.ema_model(images) + ema2.ema_model(images)) / 2.0)
+                                
+                                # TTA 2: 水平翻转图像
+                                images_hflip = torch.flip(images, dims=[3])
+                                p2 = torch.sigmoid((ema1.ema_model(images_hflip) + ema2.ema_model(images_hflip)) / 2.0)
+                                
+                                # 计算均值和方差
+                                mean_probs = (p1 + p2) / 2.0
+                                var_probs = torch.var(torch.stack([p1, p2]), dim=0)
+                                
+                                ema_preds[indices] = mean_probs
+                                ema_vars[indices] = var_probs
 
                         # ==========================================
-                        # 1. 拷贝原始硬标签
+                        # 🌟 修改 4 & 5 融合：带共现约束与不确定性过滤的 FN 挖掘
                         # ==========================================
                         final_soft_targets = all_targets.float().clone()
 
-                        # ==========================================
-                        # 动作 1：处理假阳性 (FP) —— 继承前期的 MEE 成果
-                        # ==========================================
+                        # 处理 FP (保持不变，但加入极值压制防坍塌)
                         fp_mask = (all_targets == 1) & (~global_label_mask)
-                        final_soft_targets[fp_mask] = ema_preds[fp_mask] 
+                        final_soft_targets[fp_mask] = torch.clamp(ema_preds[fp_mask], max=0.5) 
 
                         # ==========================================
-                        # 动作 2：挖掘假阴性 (FN) —— 使用巅峰 EMA 绝杀
+                        # 🌟 重大升级：引入医学大模型 (LLM) 先验知识矩阵
                         # ==========================================
-                        fn_mask = (all_targets == 0) & (ema_preds > 0.8)
+                        # 1. 计算当前数据集的后验统计概率 (Data-driven，含有一定的噪声偏差)
+                        clean_pool_labels = (all_targets & global_label_mask).float() 
+                        co_counts = torch.matmul(clean_pool_labels.T, clean_pool_labels)
+                        class_counts = clean_pool_labels.sum(dim=0).clamp(min=1e-5)      
+                        data_cond_matrix = co_counts / class_counts.unsqueeze(1)         
+
+                        # 2. 加载离线生成的 LLM 医学病理先验矩阵 (Knowledge-driven，纯净但可能缺乏特定数据集的域分布)
+                        # 请确保将 LLM 生成的矩阵保存在同级目录下
+                        try:
+                            llm_prior_matrix = torch.from_numpy(np.load('/data/dsj/lys/SqR-NEW/medical_prior_matrix.npy')).float().to(device)
+                            logger.info("    -> Successfully loaded LLM Medical Prior Matrix!")
+                        except FileNotFoundError:
+                            logger.warning("    -> medical_prior_matrix.npy not found! Falling back to purely data-driven matrix.")
+                            llm_prior_matrix = data_cond_matrix 
+
+                        # 3. 混合先验 (Hybrid Prior): 结合病理常识与当前医院数据的真实分布
+                        alpha = 0.7  # 信任 LLM 的权重 (0.6 表示以医学常识为主，数据统计为辅)
+                        cond_prob_matrix = alpha * llm_prior_matrix + (1.0 - alpha) * data_cond_matrix       
+
+                        fn_mask = torch.zeros_like(all_targets, dtype=torch.bool).to(device)
+                        
+                        # 2. 逐类别进行受控的 FN 挖掘
+                        for c in range(args.num_class):
+                            # A. TTA 均值高，且方差小 (模型认知极其坚定)
+                            high_conf_mask = (ema_preds[:, c] > 0.7) & (ema_vars[:, c] < 0.2)
+                            # 候选的漏诊样本
+                            candidate_fn = (all_targets[:, c] == 0) & high_conf_mask
+                            
+                            if not candidate_fn.any():
+                                continue
+                                
+                            # B. 共现先验过滤 (Contextual Validation)
+                            # 如果疾病 c 通常伴随其他疾病出现（例如平均条件概率 > 0.3），
+                            # 我们需要检查当前候选样本是否具备这些“伴随疾病”的医学环境。
+                            support_scores = torch.zeros(num_train_samples).to(device)
+                            # 提取出对疾病 c 有较强指示意义的伴随疾病集合 (阈值可调，如 0.2)
+                            strongly_correlated_classes = torch.where(cond_prob_matrix[:, c] > 0.2)[0]
+                            if len(strongly_correlated_classes) > 1: # 排除自身的对角线
+                                # 计算候选样本在这些关联疾病上的当前已知标签得分
+                                for correlated_c in strongly_correlated_classes:
+                                    if correlated_c != c:
+                                        # 如果关联疾病存在，加分
+                                        support_scores += all_targets[:, correlated_c].float()
+                                        
+                                # 只有当候选样本具有至少 1 个相关并发症环境，或者疾病 c 本身就高度独立时，才批准翻转
+                                approved_fn = candidate_fn & (support_scores > 0)
+                            else:
+                                # 疾病 c 本身就是独立疾病，无需伴随症支持
+                                approved_fn = candidate_fn
+
+
+
+                            #上面注释解开，下面这一行就要注释掉，因为下面这一行是没有共现约束的纯数据驱动版本    
+                            # approved_fn = candidate_fn  
+                            fn_mask[:, c] = approved_fn
+
+                        # 将筛选后、有医学常理支持、且模型认知坚定的预测写入软标签
                         final_soft_targets[fn_mask] = ema_preds[fn_mask]
 
-                        # 统计数量用于日志展示
                         fp_count = fp_mask.sum().item()
                         fn_count = fn_mask.sum().item()
 

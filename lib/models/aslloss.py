@@ -92,3 +92,39 @@ class AsymmetricLossOptimized(nn.Module):
         _loss = _loss / y.size(1) 
 
         return _loss
+class DynamicAsymmetricLoss(nn.Module):
+    def __init__(self, gamma_neg=4, gamma_pos=1, base_clip=0.05, max_clip=0.2, eps=1e-8):
+        super(DynamicAsymmetricLoss, self).__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.base_clip = base_clip
+        self.max_clip = max_clip
+        self.eps = eps
+
+    def forward(self, x, y, progress_ratio=0.0):
+        """
+        progress_ratio: 当前训练进度 (current_epoch / total_epochs)，取值 [0, 1]
+        """
+        xs_pos = torch.sigmoid(x)
+        xs_neg = 1.0 - xs_pos
+
+        # 动态 Asymmetric Clipping: 随训练深入，逐步提升 clip 阈值，拒绝拟合后期暴露的顽固噪声
+        dynamic_clip = self.base_clip + progress_ratio * (self.max_clip - self.base_clip)
+        if dynamic_clip > 0:
+            xs_neg = (xs_neg + dynamic_clip).clamp(max=1)
+
+        los_pos = y * torch.log(xs_pos.clamp(min=self.eps, max=1-self.eps))
+        los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps, max=1-self.eps))
+
+        # 动态 Gamma 聚焦: 训练后期加大对多数类（易学负样本）的抑制，释放长尾正样本的梯度空间
+        dynamic_gamma_neg = self.gamma_neg * (1.0 + progress_ratio)
+        
+        with torch.no_grad():
+            pt0 = xs_pos * y
+            pt1 = xs_neg * (1 - y)
+            pt = pt0 + pt1
+            one_sided_gamma = self.gamma_pos * y + dynamic_gamma_neg * (1 - y)
+            one_sided_w = torch.pow(1 - pt, one_sided_gamma)
+
+        loss = (los_pos + los_neg) * one_sided_w
+        return -loss.sum() / x.size(0)

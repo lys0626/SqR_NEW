@@ -13,12 +13,12 @@ class model(nn.Module):
         # Stage 1: 提取浅层特征 (用于拼接操作)
         self.stage1 = nn.Sequential(
             M.conv1, M.bn1, M.relu, M.maxpool,
-            M.layer1, M.layer2  # 在 layer2 输出端 (512通道) 截断进行特征拼接
+            M.layer1, M.layer2,M.layer3  # 在 layer2 输出端 (512通道) 截断进行特征拼接
         )
         
         # Stage 2: 提取深层特征
         self.stage2 = nn.Sequential(
-            M.layer3, M.layer4
+             M.layer4
         )
         # self.stage1 = nn.Sequential(M.conv1, M.bn1, M.relu, M.maxpool, M.layer1)
         # # # Stage 2: 提取深层特征

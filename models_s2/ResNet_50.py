@@ -9,9 +9,9 @@ class model(nn.Module):
         M = torchvision.models.resnet50(pretrained=pretrained)
         # --- 核心修改：拆分 Backbone ---
         # Stage 1: 提取浅层特征 (至 layer2，特征图尺寸适中，适合拼接)
-        self.stage1 = nn.Sequential(M.conv1, M.bn1, M.relu, M.maxpool, M.layer1, M.layer2)
+        self.stage1 = nn.Sequential(M.conv1, M.bn1, M.relu, M.maxpool, M.layer1, M.layer2,M.layer3)
         # Stage 2: 提取深层特征
-        self.stage2 = nn.Sequential(M.layer3, M.layer4)
+        self.stage2 = nn.Sequential( M.layer4)
 
         # self.stage1 = nn.Sequential(M.conv1, M.bn1, M.relu, M.maxpool, M.layer1)
         # # # Stage 2: 提取深层特征
