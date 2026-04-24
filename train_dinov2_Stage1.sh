@@ -3,7 +3,7 @@
 set -e  # <--- [强烈建议新增] 只要发生任何报错，脚本立刻停止，绝不往下瞎跑！
 
 # ================= 1. 基础全局配置 =================
-GPU_ID=5
+GPU_ID=1
 # export CUDA_VISIBLE_DEVICES=${GPU_ID}      # 指定使用的单卡 GPU 编号
 
 DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
@@ -14,7 +14,7 @@ DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
 # DATASET_NAME_UPPER="NIH-CHEST"
 # DATA_DIR="/data/nih-chest-xrays"
 
-EXP_DIR="./experiment/4_18_0.975_DinoV2_ASL_AdamW_1e-4_new_label_no_mask_EMA"        # 实验输出的顶层根目录
+EXP_DIR="./experiment/4_25_DinoV2_2_3_4_0.995_old"        # 实验输出的顶层根目录
 # EXP_DIR="./experiment/vision"
 # ================= 2. 方法选择配置 =================
 # 可选值: "splicemix" 或 "splicemix-cl"，或 baseline（不使用任何增强）
@@ -22,11 +22,9 @@ STAGE2_METHOD="splicemix-cl"             # 配置为 "splicemix" 或 "splicemix-
 NUM_CLASS=13
 
 # ================= 3. 动态生成输出目录 =================
-STAGE1_OUT="${EXP_DIR}/${DATASET_NAME}/stage1_${STAGE2_METHOD}_q2l"
-STAGE2_OUT="${EXP_DIR}/${DATASET_NAME}/stage2_${STAGE2_METHOD}"
+STAGE1_OUT="${EXP_DIR}/${DATASET_NAME}/stage1_${STAGE2_METHOD}"
 
 mkdir -p "${STAGE1_OUT}"
-mkdir -p "${STAGE2_OUT}"
 
 echo "==================================================="
 echo "  [STEP 1] 启动 Stage 1: Q2L 预热与 MEE(Early Cutting) 标签级清洗"
@@ -38,7 +36,7 @@ python stage1_main_dinov2.py \
   --dataname "${DATASET_NAME}" \
   --dataset_dir "${DATA_DIR}" \
   --output "${STAGE1_OUT}" \
-  --epochs 60 \
+  --epochs 50 \
   --batch-size 128 \
   --lr 1e-4 \
   -cd ${GPU_ID} \
@@ -47,9 +45,9 @@ python stage1_main_dinov2.py \
   --workers 8 \
   --pretrained \
   --warm_up_epochs 6 \
-  --fkl_consecutive_epochs 3 \
-  --early_cutting_rate 1.5 \
-  --newremove_rate 75000 \
+  --fkl_consecutive_epochs 5 \
+  --early_cutting_rate 5 \
+  --newremove_rate 15000 \
   --top_conf_ratio 0.2 \
   --low_grad_ratio 0.2 \
   --optim AdamW 

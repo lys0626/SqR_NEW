@@ -69,6 +69,11 @@ class Engine(object):
         # --- 新增：EMA 模型的追踪 ---
         self.result['ema_val'] = {'epoch': [], 'loss': [], 'mAUC': [], 'micro_F1': []}
         self.result['ema_val_best'] = {'epoch': 0, 'loss': -1., 'mAUC': -1., 'metrics': {}}
+        # 测试集 (Test) 记录器
+        self.result['test'] = {'epoch': [], 'loss': [], 'mAUC': [], 'micro_F1': []}
+        self.result['test_best'] = {'epoch': 0, 'loss': -1., 'mAUC': -1., 'metrics': {}}
+        self.result['ema_test'] = {'epoch': [], 'loss': [], 'mAUC': [], 'micro_F1': []}
+        self.result['ema_test_best'] = {'epoch': 0, 'loss': -1., 'mAUC': -1., 'metrics': {}}
         self.meter = {}
         self.reset_meters()
 
@@ -87,7 +92,7 @@ class Engine(object):
         self.init()
 
     def init(self):
-        train_set, test_set, self.args.num_classes = utils.get_dataset(self.args)
+        train_set, val_set, test_set, self.args.num_classes = utils.get_dataset(self.args)
 
         # ==========================================
         # 🌟 核心接入：覆盖训练集的 Target 为软标签
@@ -110,7 +115,7 @@ class Engine(object):
             self.logger.warning(" !!! No soft labels found. Training with ORIGINAL HARD LABELS !!!")
         # ==========================================
 
-        self.dataset = {'train': train_set, 'test': test_set}
+        self.dataset = {'train': train_set, 'val': val_set, 'test': test_set}
         self.scaler = GradScaler(enabled=not self.args.disable_amp)
 
         args = {}
@@ -120,8 +125,8 @@ class Engine(object):
         self.optimizer = utils.get_optimizer(self.args, self.model)
         self.loss_fn = getattr(models, self.args.model).Loss_fn().to(self.rank)
         
-        self.train_loader, self.test_loader = utils.get_dataloader(train_set=self.dataset['train'],
-                                                       test_set=self.dataset['test'], args=self.args)
+        self.train_loader, self.val_loader, self.test_loader = utils.get_dataloader(
+            train_set=train_set, val_set=val_set, test_set=test_set, args=self.args)
         if self.args.warmup_epochs > 0:
             self.warmup_scheduler = warmup.WarmUpLR(self.optimizer,
                                                     total_iters=len(self.train_loader) * self.args.warmup_epochs)
@@ -172,41 +177,41 @@ class Engine(object):
     #     self.on_end_epoch(is_train=False, result=self.result['val'], result_best=self.result['val_best'])
     def evaluate(self, epoch=0):
         torch.cuda.empty_cache()
-        val_loader = self.test_loader
         
         # 定义需要评估的模型列表
         eval_pairs = []
         # 如果是训练阶段，才需要评估普通模型
         if self.args.is_train:
             # 训练阶段：普通模型和 EMA 模型都要评估以对比记录
-            eval_pairs.append({'model': self.model, 'res': self.result['val'], 'best': self.result['val_best'], 'is_ema': False})
+            eval_pairs.append({'model': self.model, 'loader': self.val_loader, 'res': self.result['val'], 'best': self.result['val_best'], 'is_ema': False, 'tag': 'Val'})
+            eval_pairs.append({'model': self.model, 'loader': self.test_loader, 'res': self.result['test'], 'best': self.result['test_best'], 'is_ema': False, 'tag': 'Test'})
             if hasattr(self, 'ema'):
-                eval_pairs.append({'model': self.ema.ema, 'res': self.result['ema_val'], 'best': self.result['ema_val_best'], 'is_ema': True})
+                eval_pairs.append({'model': self.ema.ema, 'loader': self.val_loader, 'res': self.result['ema_val'], 'best': self.result['ema_val_best'], 'is_ema': True, 'tag': 'EMA-Val'})
+                eval_pairs.append({'model': self.ema.ema, 'loader': self.test_loader, 'res': self.result['ema_test'], 'best': self.result['ema_test_best'], 'is_ema': True, 'tag': 'EMA-Test'})
         else:
             # 纯测试阶段：根据加载的权重类型，只评估对应的一个模型
             is_ema_loaded = getattr(self, 'loaded_is_ema', False)
             
             # 双重保险：如果 checkpoint 字典里写了是 EMA，或者文件名里带了 'EMA'
-            if is_ema_loaded or 'EMA' in self.args.resume:
-                eval_pairs.append({'model': self.ema.ema, 'res': self.result['ema_val'], 'best': self.result['ema_val_best'], 'is_ema': True})
+            # if is_ema_loaded or 'EMA' in self.args.resume:
+            if is_ema_loaded or 'EMA' in os.path.basename(self.args.resume):
+                eval_pairs.append({'model': self.ema.ema, 'loader': self.test_loader, 'res': self.result['ema_test'], 'best': self.result['ema_test_best'], 'is_ema': True, 'tag': 'EMA-Test'})
             else:
-                eval_pairs.append({'model': self.model, 'res': self.result['val'], 'best': self.result['val_best'], 'is_ema': False})
+                eval_pairs.append({'model': self.model, 'loader': self.test_loader, 'res': self.result['test'], 'best': self.result['test_best'], 'is_ema': False, 'tag': 'Test'})
         for item in eval_pairs:
             m = item['model']
             m.eval()
-            self.on_start_epoch(epoch) # 重置当前模型的统计器
+            self.on_start_epoch(epoch) 
             
-            self.logger.info(f"==> Evaluating {'EMA ' if item['is_ema'] else 'Standard '}Model...")
+            self.logger.info(f"==> Evaluating {item['tag']} Set...")
             
-            for i, data in enumerate(val_loader):
+            for i, data in enumerate(item['loader']):
                 inputs, targets, targets_gt, file_name = self.on_start_batch(data)
-                
                 with torch.no_grad():
                     with autocast(enabled=not self.args.disable_amp):
                         if not item['is_ema']:
                             outputs, loss = self.on_forward(inputs, targets, file_name, is_train=False)
                         else:
-                            # EMA 专用前向传播 (无 mixer)
                             outputs = m(inputs)
                             if isinstance(outputs, tuple): outputs = outputs[0]
                             if isinstance(outputs, dict): outputs = outputs['logits_mixed']
@@ -215,8 +220,8 @@ class Engine(object):
                 outputs = outputs[:inputs.shape[0]].data
                 self.on_end_batch(outputs, targets_gt.data, loss.data, file_name)
 
-            # 调用修改后的 on_end_epoch 记录结果并保存各自的 Best 权重
-            self.on_end_epoch(is_train=False, result=item['res'], result_best=item['best'], is_ema=item['is_ema'])
+            # 传入 eval_tag，用于精准控制日志和权重保存
+            self.on_end_epoch(is_train=False, result=item['res'], result_best=item['best'], is_ema=item['is_ema'], eval_tag=item['tag'])
     def on_forward(self, inputs, targets, file_name, is_train):
         args = {}
         if is_train:
@@ -293,7 +298,7 @@ class Engine(object):
         self.epoch = epoch
         self.epoch_time = time.time()
         self.reset_meters()
-    def on_end_epoch(self, is_train, result, result_best=None, is_ema=False):
+    def on_end_epoch(self, is_train, result, result_best=None, is_ema=False,eval_tag='Val'):
         self.lr_curr = utils.get_learning_rate(self.optimizer)
         self.epoch_time = time.time() - self.epoch_time
         meter = self.meter
@@ -329,8 +334,8 @@ class Engine(object):
         # --- 格式化日志字符串 ---
         str_metrics = ""
         # 定义日志前缀
-        log_tag = "Train" if is_train else ("EMA-Test" if is_ema else "Test")
-        
+        # log_tag = "Train" if is_train else ("EMA-Test" if is_ema else "Test")
+        log_tag = "Train" if is_train else eval_tag
         if not is_train and 'mAUC' in metrics_res:
             str_metrics = (
                 f"mAUC: {metrics_res['mAUC']:.4f}, "
@@ -378,7 +383,8 @@ class Engine(object):
             self.logger.info(str_best)
 
         if not is_train and self.args.evaluate != 0 and utils_ddp.is_main_process():
-            self.save_checkpoint(is_best=is_best, is_ema=is_ema) # ✅ 显式传参
+            if 'Val' in eval_tag: 
+                self.save_checkpoint(is_best=is_best, is_ema=is_ema)
         if self.args.distributed:
             utils_ddp.barrier()
     # def on_end_epoch(self, is_train, result, result_best=None,is_ema=False):
@@ -531,11 +537,21 @@ class Engine(object):
 
             # 2. 处理键名 (去除 module. 前缀以匹配单机模型)
             new_state_dict = {}
+            base_model = self.model.module if hasattr(self.model, 'module') else self.model
+            stage1_len = len(base_model.stage1) if hasattr(base_model, 'stage1') else 0
+            
             for k, v in loaded_dict.items():
-                if k.startswith('module.'):
-                    name = k[7:] # 去除 'module.'
-                else:
-                    name = k
+                name = k[7:] if k.startswith('module.') else k
+                
+                # 兼容旧版本 backbone 权重
+                if name.startswith('backbone.') and stage1_len > 0:
+                    parts = name.split('.')
+                    idx = int(parts[1])
+                    if idx < stage1_len:
+                        name = f"stage1.{idx}." + ".".join(parts[2:])
+                    else:
+                        name = f"stage2.{idx - stage1_len}." + ".".join(parts[2:])
+                        
                 new_state_dict[name] = v
             
             # 3. 加载权重 (strict=False 允许稍微的不匹配，但关键是不要主动过滤 cls)

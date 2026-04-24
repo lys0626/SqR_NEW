@@ -81,36 +81,39 @@ def set_seed(seed=95):
             cudnn.deterministic = False # If true, the speed may be low
             torch.backends.cudnn.benchmark = True
 
-def get_dataloader(train_set=None, test_set=None, args=None):
+def get_dataloader(train_set=None, val_set=None, test_set=None, args=None):
     pin_memory = False
-    train_loader, test_loader = None, None
-    if train_set != None:
-        if args.distributed: # DDP 模式
-            train_sampler = DistributedSampler(dataset=train_set, shuffle=True)
-        else: # 单 GPU 模式
-            train_sampler = None
-            
-        train_loader = DataLoader(train_set, batch_size=args.batch_size_per,
-                                  num_workers=args.num_workers, pin_memory=pin_memory,
-                                  drop_last=True, sampler=train_sampler, collate_fn=None,
-                                  shuffle=(train_sampler is None)) # 只有在非DDP时才启用 shuffle
-    if test_set != None:
-        if args.distributed: # DDP 模式
-            test_sampler = DistributedSampler(dataset=test_set, shuffle=False)
-        else: # 单 GPU 模式
-            test_sampler = None
-            
-        test_loader = DataLoader(test_set, batch_size=args.batch_size_per,
-                                num_workers=args.num_workers, pin_memory=pin_memory,
-                                drop_last=False, sampler=test_sampler)
-    return train_loader, test_loader
+    train_loader, val_loader, test_loader = None, None, None
+    
+    if train_set is not None:
+        train_sampler = DistributedSampler(dataset=train_set, shuffle=True) if args.distributed else None
+        train_loader = DataLoader(train_set, batch_size=args.batch_size_per, num_workers=args.num_workers, 
+                                  pin_memory=pin_memory, drop_last=True, sampler=train_sampler, 
+                                  shuffle=(train_sampler is None))
+    
+    # 构造 Validation Loader
+    if val_set is not None:
+        val_sampler = DistributedSampler(dataset=val_set, shuffle=False) if args.distributed else None
+        val_loader = DataLoader(val_set, batch_size=args.batch_size_per, num_workers=args.num_workers, 
+                                pin_memory=pin_memory, drop_last=False, sampler=val_sampler)
+        
+    # 构造 Test Loader
+    if test_set is not None:
+        test_sampler = DistributedSampler(dataset=test_set, shuffle=False) if args.distributed else None
+        test_loader = DataLoader(test_set, batch_size=args.batch_size_per, num_workers=args.num_workers, 
+                                 pin_memory=pin_memory, drop_last=False, sampler=test_sampler)
+                                 
+    return train_loader, val_loader, test_loader
 
 def get_dataset(args):
     # --- MODIFIED: data_dict 现在包含所有新数据集
     data_dict = {'MS-COCO': COCO2014, 'VOC2007': VOC2007,'NIH-CHEST':nihchest, 'MIMIC':mimic, 'CHEXPERT':chexpert}
     train_transfm = get_transform(args, is_train=True)
     test_transfm = get_transform(args, is_train=False)
-
+    # ================= 核心修复 =================
+    # 提前声明变量并赋默认值，防止分支漏掉导致 UnboundLocalError
+    train_set, val_set, test_set = None, None, None
+    # ============================================
     if args.data_set in ('MS-COCO'):
         data_dir = opj(args.data_root, 'COCO2014')
         test_set = data_dict[args.data_set](data_dir, phase='val', transform=test_transfm)
@@ -125,20 +128,30 @@ def get_dataset(args):
     elif args.data_set in ('NIH-CHEST'):
         data_dir = args.data_root
         # [修改点] 动态判断：如果是训练模式就用 valid，如果是纯评估模式就用 test
-        eval_mode = 'valid' if args.is_train else 'test'
-        if not args.is_train:
-            print(f"!!! [Evaluation Mode] Loading TEST dataset for NIH-CHEST !!!")
-        test_set = data_dict[args.data_set](data_dir, mode=eval_mode, transform=test_transfm)
-        train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
+        if args.is_train:
+            # 训练模式：同时加载 Train, Val 和 Test
+            train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
+            val_set = data_dict[args.data_set](data_dir, mode='valid', transform=test_transfm)
+            test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm)
+        else:
+            # 纯测试模式：只加载 Train (占位) 和 Test
+            print(f"!!! [Evaluation Mode] Loading TEST dataset for {args.data_set} !!!")
+            train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
+            test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm)
     
     # --- MODIFIED: 合并了 MIMIC 和 CHEXPERT 的逻辑
     elif args.data_set in ('MIMIC'):
         data_dir = args.data_root # 假设根目录设置正确
-        eval_mode = 'valid' if args.is_train else 'test'
-        if not args.is_train:
-            print(f"!!! [Evaluation Mode] Loading TEST dataset for NIH-CHEST !!!")
-        test_set = data_dict[args.data_set](data_dir, mode=eval_mode, transform=test_transfm)
-        train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
+        if args.is_train:
+            # 训练模式：同时加载 Train, Val 和 Test
+            train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
+            val_set = data_dict[args.data_set](data_dir, mode='valid', transform=test_transfm)
+            test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm)
+        else:
+            # 纯测试模式：只加载 Train (占位) 和 Test
+            print(f"!!! [Evaluation Mode] Loading TEST dataset for {args.data_set} !!!")
+            train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
+            test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm)
     else:
         raise ValueError(f"未知的数据集: {args.data_set}")
 
@@ -154,7 +167,7 @@ def get_dataset(args):
         # 将原始训练集强行缩减为只有干净样本的子集
         train_set = Subset(train_set, clean_indices)
     # ---------------------------------------------
-    return train_set, test_set, num_classes
+    return train_set, val_set, test_set, num_classes
 
 def get_transform(args, is_train=True):
 

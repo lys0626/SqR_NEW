@@ -104,12 +104,12 @@ def parser_args():
     parser.add_argument('--orid_norm', action='store_true', default=False)
 
     # Phase 控制参数
-    parser.add_argument("--i_rate_1", type=int, default=2)
-    parser.add_argument("--i_rate_2", type=int, default=0)
-    parser.add_argument("--i_rate_3", type=int, default=0)
+    parser.add_argument("--i_rate_1", type=int, default=3)
+    parser.add_argument("--i_rate_2", type=int, default=3)
+    parser.add_argument("--i_rate_3", type=int, default=3)
     parser.add_argument("--i_rate_4", type=int, default=0)
     
-    parser.add_argument("--remove_rate_1", type=float, default=0.975)
+    parser.add_argument("--remove_rate_1", type=float, default=0.995)
     parser.add_argument("--remove_rate_2", type=float, default=0.995)
     parser.add_argument("--remove_rate_3", type=float, default=0.995)
     parser.add_argument("--remove_rate_4", type=float, default=0.995)
@@ -318,7 +318,7 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
     
     torch.cuda.empty_cache() 
     
-    grad_bs = 8  
+    grad_bs = 32  
     
     logger.info(f"    -> [Memory Protector] Re-building subset loader with ultra-small batch size: {grad_bs}")
     
@@ -349,8 +349,22 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
 
         images.requires_grad_(False)
 
-    conf_thresh = torch.quantile(conf_arr, 1.0 - args.top_conf_ratio)
-    grad_thresh = torch.quantile(grad_arr, args.low_grad_ratio)
+    # ================= 修改前 =================
+    # conf_thresh = torch.quantile(conf_arr, 1.0 - args.top_conf_ratio)
+    # grad_thresh = torch.quantile(grad_arr, args.low_grad_ratio)
+    # ================= 修改后 =================
+    # 1. 计算动态分位数
+    dynamic_conf_thresh = torch.quantile(conf_arr, 1.0 - args.top_conf_ratio)
+    dynamic_grad_thresh = torch.quantile(grad_arr, args.low_grad_ratio)
+    
+    # 2. 引入绝对物理意义的“保底防线”
+    # 置信度 |p-0.5| 绝对不能低于 0.35 (即模型预测概率必须 >0.85 或 <0.15 才算高置信度)
+    min_allowed_conf = torch.tensor(0.35).to(device)
+    conf_thresh = torch.max(dynamic_conf_thresh, min_allowed_conf)
+    
+    # 梯度必须小于候选池平均梯度的 0.6 倍，防止 quantile 选出相对较大梯度的样本
+    max_allowed_grad = grad_arr.mean() * 0.6
+    grad_thresh = torch.min(dynamic_grad_thresh, max_allowed_grad)
     
     is_mee = (conf_arr >= conf_thresh) & (grad_arr <= grad_thresh)
     mee_local_idx = torch.arange(num_candidates)[is_mee.cpu()]
@@ -377,11 +391,11 @@ def pick_remove_rate_by_phase(rn, i1, i2, i3, r1, r2, r3, r4):
 
 def get_fkl_required_epochs(rn, i1, i2, i3):
     if rn <= i1:
-        return 1
-    elif rn <= i1 + i2:
         return 2
-    elif rn <= i1 + i2 + i3:
+    elif rn <= i1 + i2:
         return 3
+    elif rn <= i1 + i2 + i3:
+        return 4
     else:
         return 4
 
@@ -464,6 +478,29 @@ def main():
         net1 = build_dino(args).to(device)
         net2 = build_dino(args).to(device)
         
+        # # ==========================================
+        # # 🌟 进阶修复：表征继承 + 决策头重置 (Head Reset)
+        # # ==========================================
+        # best_ckpt_path = os.path.join(args.output, 'best_stage1_model.pth')
+        # if round_num > 1 and os.path.exists(best_ckpt_path):
+        #     logger.info(f"    -> [Continual Learning] Restoring Backbone weights from Round {round_num-1}...")
+        #     checkpoint = torch.load(best_ckpt_path, map_location=device)
+            
+        #     # 加载全部权重
+        #     net1.load_state_dict(checkpoint['net1'])
+        #     net2.load_state_dict(checkpoint['net2'])
+            
+        #     # 【核心逻辑】：重置分类器 (fc) 的权重和偏置
+        #     # 使用 Xavier 均匀分布初始化权重，将偏置清零
+        #     torch.nn.init.xavier_uniform_(net1.fc.weight)
+        #     torch.nn.init.zeros_(net1.fc.bias)
+            
+        #     torch.nn.init.xavier_uniform_(net2.fc.weight)
+        #     torch.nn.init.zeros_(net2.fc.bias)
+            
+        #     logger.info(f"    -> [Head Reset] Successfully re-initialized the Classifier Heads to clear Confirmation Bias!")
+
+        # 2. 利用继承了 Backbone 但重置了 Head 的 net1/net2 初始化 EMA 老师
         ema1 = ModelEMA(net1, alpha=0.999)
         ema2 = ModelEMA(net2, alpha=0.999)
         models = (net1, net2, ema1.ema_model, ema2.ema_model)
@@ -607,7 +644,8 @@ def main():
 
                         # 处理 FP (保持不变，但加入极值压制防坍塌)
                         fp_mask = (all_targets == 1) & (~global_label_mask)
-                        final_soft_targets[fp_mask] = torch.clamp(ema_preds[fp_mask], max=0.5) 
+                        # final_soft_targets[fp_mask] = torch.clamp(ema_preds[fp_mask], max=0.5) 
+                        final_soft_targets[fp_mask] = torch.clamp(ema_preds[fp_mask], max=1) 
 
                         # ==========================================
                         # 🌟 重大升级：引入医学大模型 (LLM) 先验知识矩阵
@@ -618,17 +656,29 @@ def main():
                         class_counts = clean_pool_labels.sum(dim=0).clamp(min=1e-5)      
                         data_cond_matrix = co_counts / class_counts.unsqueeze(1)         
 
-                        # 2. 加载离线生成的 LLM 医学病理先验矩阵 (Knowledge-driven，纯净但可能缺乏特定数据集的域分布)
-                        # 请确保将 LLM 生成的矩阵保存在同级目录下
+                        # 2. 根据 dataname 动态加载离线生成的 LLM 医学病理先验矩阵
+                        # 文件名格式: medical_prior_matrix_{dataname}.npy
+                        prior_filename = f'medical_prior_matrix_{args.dataname}.npy'
+                        prior_path = os.path.join('/data/dsj/lys/SqR-NEW/', prior_filename)
                         try:
-                            llm_prior_matrix = torch.from_numpy(np.load('/data/dsj/lys/SqR-NEW/medical_prior_matrix.npy')).float().to(device)
-                            logger.info("    -> Successfully loaded LLM Medical Prior Matrix!")
-                        except FileNotFoundError:
-                            logger.warning("    -> medical_prior_matrix.npy not found! Falling back to purely data-driven matrix.")
+                            # 尝试以二进制模式加载 numpy 数组
+                            matrix_np = np.load(prior_path, allow_pickle=True).astype(np.float32)
+                            llm_prior_matrix = torch.from_numpy(matrix_np).to(device)
+                            
+                            # 检查加载的矩阵维度是否与当前任务的类别数匹配
+                            if llm_prior_matrix.shape[0] != args.num_class:
+                                raise ValueError(f"Matrix shape {llm_prior_matrix.shape} does not match args.num_class {args.num_class}")
+                                
+                            logger.info(f"    -> Successfully loaded LLM Medical Prior Matrix: {prior_filename}")
+                            
+                        except Exception as e:
+                            # 如果文件不存在、损坏或维度不匹配，发出警告并回退到纯数据驱动矩阵
+                            logger.warning(f"    -> [WARNING] Failed to load LLM matrix {prior_filename}. Reason: {e}")
+                            logger.warning("    -> Falling back to purely data-driven matrix to prevent crash.")
                             llm_prior_matrix = data_cond_matrix 
 
                         # 3. 混合先验 (Hybrid Prior): 结合病理常识与当前医院数据的真实分布
-                        alpha = 0.7  # 信任 LLM 的权重 (0.6 表示以医学常识为主，数据统计为辅)
+                        alpha = 0.7  # 信任 LLM 的权重 (0.7 表示以医学常识为主，数据统计为辅)
                         cond_prob_matrix = alpha * llm_prior_matrix + (1.0 - alpha) * data_cond_matrix       
 
                         fn_mask = torch.zeros_like(all_targets, dtype=torch.bool).to(device)

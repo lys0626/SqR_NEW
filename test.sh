@@ -4,16 +4,16 @@
 # ==============================================================================
 
 # ================= 1. 配置必须与训练时一致 =================
-GPU_ID=4
-DATASET_NAME="nih"
-DATASET_NAME_UPPER="NIH-CHEST"
-DATA_DIR="/data/nih-chest-xrays"
+GPU_ID=6
+# DATASET_NAME="nih"
+# DATASET_NAME_UPPER="NIH-CHEST"
+# DATA_DIR="/data/nih-chest-xrays"
 
-# DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
-# DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
-# DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
+DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
+DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
+DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
 
-STAGE2_METHOD="splicemix"             # 配置为 "splicemix" 或 "splicemix-cl" 或 baseline
+STAGE2_METHOD="splicemix"             # 配置为 "splicemix" 或 "splicemix-cl" 或 baseline.对测试结果无影响
 # DATANAME="nih"
 # DATASET_NAME_UPPER="NIH-CHEST"
 # DATA_DIR="/data/nih-chest-xrays"
@@ -44,7 +44,7 @@ else
     METHOD_SUFFIX="baseline"        # <--- 新增 (对应 engine.py) 
 fi
 
-WEIGHTS_PATH="/data/dsj/lys/SqR-NEW/experiment/4.17_layer3/nih/stage2_splicemix/NIH-CHEST/ResNet_50/ChkpotBest_ResNet_50.pt"
+WEIGHTS_PATH="/data/dsj/lys/SqR-NEW/experiment/4.24_3_0.995_label_old_EMA_0.999/mimic/stage2_splicemix-cl/MIMIC/SpliceMix_CL/ChkpotBest_SpliceMix_CL.pt"
 echo "==================================================="
 echo "  启动测试评估模式 (Evaluate Only) "
 echo "  ==> 评估方法: ${STAGE2_METHOD}"
@@ -57,7 +57,7 @@ python stage2_main.py \
   --data-root "${DATA_DIR}" \
   --model "${MODEL_ARG}" \
   -mixer "${MIXER_ARG}" \
-  --batch-size 256 \
+  --batch-size 512 \
   -e 0 \
   -r "${WEIGHTS_PATH}" \
   -cd ${GPU_ID}
