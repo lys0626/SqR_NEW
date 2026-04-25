@@ -120,8 +120,9 @@ class SpliceMix(object):
 
         if n_drop > 0:
             targets = targets * (1 - drop_ind[:, None])
-        targets_mix = targets.view(n_grid, g, -1).sum(1)  # ng, nc
-        targets_mix[targets_mix > 0] = 1
+        # targets_mix = targets.view(n_grid, g, -1).sum(1)  # ng, nc
+        # targets_mix[targets_mix > 0] = 1
+        targets_mix = targets.view(n_grid, g, -1).max(dim=1)[0]
         return inputs_mix, targets_mix, drop_ind
 
     def Smix_minimalism(self, X, Y):
