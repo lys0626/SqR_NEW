@@ -93,7 +93,8 @@ class AsymmetricLossOptimized(nn.Module):
 
         return _loss
 class DynamicAsymmetricLoss(nn.Module):
-    def __init__(self, gamma_neg=4, gamma_pos=1, base_clip=0.05, max_clip=0.2, eps=1e-8):
+    # 【修改点 1】：将 eps=1e-8 改为 eps=1e-5，完美兼容 AMP float16
+    def __init__(self, gamma_neg=4, gamma_pos=1, base_clip=0.05, max_clip=0.2, eps=1e-5):
         super(DynamicAsymmetricLoss, self).__init__()
         self.gamma_neg = gamma_neg
         self.gamma_pos = gamma_pos
@@ -113,8 +114,9 @@ class DynamicAsymmetricLoss(nn.Module):
         if dynamic_clip > 0:
             xs_neg = (xs_neg + dynamic_clip).clamp(max=1)
 
-        los_pos = y * torch.log(xs_pos.clamp(min=self.eps, max=1-self.eps))
-        los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps, max=1-self.eps))
+        # 【修改点 2】：移除 max=1-self.eps，只保留 min=self.eps 防护下溢出 (防 log(0) 变 -inf)
+        los_pos = y * torch.log(xs_pos.clamp(min=self.eps))
+        los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps))
 
         # 动态 Gamma 聚焦: 训练后期加大对多数类（易学负样本）的抑制，释放长尾正样本的梯度空间
         dynamic_gamma_neg = self.gamma_neg * (1.0 + progress_ratio)

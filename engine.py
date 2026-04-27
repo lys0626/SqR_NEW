@@ -162,19 +162,6 @@ class Engine(object):
             if self.args.evaluate > 0 and ((epoch % self.args.evaluate == 0) or epoch == 1):
                 self.evaluate(epoch=epoch)
 
-    # def evaluate(self, epoch=0):
-    #     torch.cuda.empty_cache()
-    #     val_loader = self.test_loader
-
-    #     self.model.eval()
-    #     self.on_start_epoch(epoch)
-        
-    #     for i, data in enumerate(val_loader):
-    #         inputs, targets, targets_gt, file_name = self.on_start_batch(data)
-    #         outputs, loss = self.on_forward(inputs, targets, file_name, is_train=False)
-    #         self.on_end_batch(outputs, targets_gt.data, loss.data, file_name)
-
-    #     self.on_end_epoch(is_train=False, result=self.result['val'], result_best=self.result['val_best'])
     def evaluate(self, epoch=0):
         torch.cuda.empty_cache()
         
@@ -223,6 +210,12 @@ class Engine(object):
             # 传入 eval_tag，用于精准控制日志和权重保存
             self.on_end_epoch(is_train=False, result=item['res'], result_best=item['best'], is_ema=item['is_ema'], eval_tag=item['tag'])
     def on_forward(self, inputs, targets, file_name, is_train):
+        # ==============================================================
+        # 1. 动态计算训练进度比例 progress_ratio (0.0 到 1.0 之间)
+        # 如果是纯测试调用没有 epoch 属性，默认取 1.0 (最严苛把关模式)
+        # ==============================================================
+        current_epoch = getattr(self, 'epoch', self.args.epochs)
+        progress_ratio = current_epoch / self.args.epochs if self.args.epochs > 0 else 1.0
         args = {}
         if is_train:
             with autocast(enabled=not self.args.disable_amp):
@@ -236,15 +229,24 @@ class Engine(object):
                     }
                 
                 outputs = self.model(inputs, args)
-                # targets_gt 将在 Loss_fn 内部被替换为 targets_all，这里传入原始 targets 仅做占位
+                #原有的BCE LOSS
                 loss = self.loss_fn(outputs, targets)
-                # --------------------------------------------------------
-                # if 'SpliceMix' in self.args.mixer:
-                #     inputs, targets, flag = self.mixer(inputs, targets)
-                # if self.args.model in ['SpliceMix_CL']: args = {'flag': flag,}
-                # outputs = self.model(inputs, args)
-                # loss = self.loss_fn(outputs, targets)
 
+                # #下面是采用动态 ASL loss
+                # # 2. 将 progress_ratio 注入到损失函数中！
+                # # loss = self.loss_fn(outputs, targets, progress_ratio=progress_ratio)
+                # # ==========================================
+                # # 【修改点 1】：自适应兼容 Loss 传参 (训练阶段)
+                # # ==========================================
+                # try:
+                #     # 尝试调用支持 D-ASL 的新版 Loss (带进度参数)
+                #     loss = self.loss_fn(outputs, targets, progress_ratio=progress_ratio)
+                # except TypeError as e:
+                #     # 如果报错提示不支持 progress_ratio，则自动回退到普通 Loss 计算
+                #     if 'progress_ratio' in str(e):
+                #         loss = self.loss_fn(outputs, targets)
+                #     else:
+                #         raise e # 抛出其他非参数类型的真实错误
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
             if self.args.disable_amp:
@@ -262,6 +264,20 @@ class Engine(object):
                     outputs = self.model(inputs, args)
                     loss = self.loss_fn(outputs, targets)
 
+                    # # 测试验证时，同样注入进度 (此时等于 1.0)
+                    # # loss = self.loss_fn(outputs, targets, progress_ratio=progress_ratio)
+
+
+                    # # ==========================================
+                    # # 【修改点 2】：自适应兼容 Loss 传参 (测试验证阶段)
+                    # # ==========================================
+                    # try:
+                    #     loss = self.loss_fn(outputs, targets, progress_ratio=progress_ratio)
+                    # except TypeError as e:
+                    #     if 'progress_ratio' in str(e):
+                    #         loss = self.loss_fn(outputs, targets)
+                    #     else:
+                    #         raise e
         outputs = outputs[0][:inputs.shape[0]].data if type(outputs) == tuple else outputs[:inputs.shape[0]].data
         return outputs, loss
 
@@ -273,11 +289,17 @@ class Engine(object):
         targets = data['target'].clone().to(self.rank)
         targets[targets == -1] = 0 # 兜底机制，消除未标注数据
         
-        # 2. targets_gt (Ground Truth) 用于喂给 Meter 计算 mAP 
+        # 2. targets_gt (Ground Truth) 用于喂给 Meter 计算指标
         # 如果包装器保存了硬标签，就用硬标签；如果是测试集没被包装，就回退用 target
+
+
+        #这两行对验证集和测试集标签为-1的进行了修改，这是修改前的代码
+        # targets_gt = data.get('target_hard', data['target']).clone().to(self.rank)
+        # targets_gt[targets_gt == -1] = 0
+
+
+        #这是修改后的代码,测试集对于-1不进行判定AUROC
         targets_gt = data.get('target_hard', data['target']).clone().to(self.rank)
-        targets_gt[targets_gt == -1] = 0
-        
         return inputs, targets, targets_gt, file_name
 
     def on_end_batch(self, outputs, targets_gt, loss, image_name=''):

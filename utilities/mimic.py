@@ -31,8 +31,9 @@ class mimic(Dataset):
         self.transform = transform
         
         # 图片所在的文件夹名
-        self.img_folder_name = 'img_224'
-        self.img_root = os.path.join(self.root, self.img_folder_name)
+        # self.img_folder_name = 'img_224'
+        # self.img_root = os.path.join(self.root, self.img_folder_name)
+        self.img_root = '/data/mimic_cxr/PA/img_224'
 
         # 1. 确定要读取的 CSV 文件名
         if mode == 'train':

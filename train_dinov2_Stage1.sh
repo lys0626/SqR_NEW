@@ -8,13 +8,13 @@ GPU_ID=1
 
 DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
 DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
-DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
+DATA_DIR="/data/mimic_cxr/PA_NEW"      # 数据集的根目录路径
 
 # DATASET_NAME="nih"
 # DATASET_NAME_UPPER="NIH-CHEST"
 # DATA_DIR="/data/nih-chest-xrays"
 
-EXP_DIR="./experiment/4_25_DinoV2_2_3_4_0.995_old"        # 实验输出的顶层根目录
+EXP_DIR="./experiment/MIMIC_-1/4_27_DinoV2_3_3_2_3_0.995_old"        # 实验输出的顶层根目录
 # EXP_DIR="./experiment/vision"
 # ================= 2. 方法选择配置 =================
 # 可选值: "splicemix" 或 "splicemix-cl"，或 baseline（不使用任何增强）

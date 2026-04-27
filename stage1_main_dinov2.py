@@ -106,7 +106,7 @@ def parser_args():
     # Phase 控制参数
     parser.add_argument("--i_rate_1", type=int, default=3)
     parser.add_argument("--i_rate_2", type=int, default=3)
-    parser.add_argument("--i_rate_3", type=int, default=3)
+    parser.add_argument("--i_rate_3", type=int, default=0)
     parser.add_argument("--i_rate_4", type=int, default=0)
     
     parser.add_argument("--remove_rate_1", type=float, default=0.995)
@@ -395,7 +395,7 @@ def get_fkl_required_epochs(rn, i1, i2, i3):
     elif rn <= i1 + i2:
         return 3
     elif rn <= i1 + i2 + i3:
-        return 4
+        return 3
     else:
         return 4
 

@@ -120,9 +120,25 @@ class SpliceMix(object):
 
         if n_drop > 0:
             targets = targets * (1 - drop_ind[:, None])
+        #软标签值大于0的视为标注为1的硬标签
         # targets_mix = targets.view(n_grid, g, -1).sum(1)  # ng, nc
         # targets_mix[targets_mix > 0] = 1
-        targets_mix = targets.view(n_grid, g, -1).max(dim=1)[0]
+
+        # ==========================================================
+        # 🚀 进阶修改：带有白噪声过滤的硬标签生成 (Soft-to-Hard)
+        # ==========================================================
+            
+        # 1. 先使用 max 获取合并网格在各个类别上的最大软概率，根据阈值区分标注为0和1的硬标签
+        targets_mix_soft = targets.view(n_grid, g, -1).max(dim=1)[0] 
+        
+        # 2. 设定阈值（如 0.05），将确定性较大的病灶强制放大为 1.0，彻底消除梯度饥饿
+        targets_mix = torch.zeros_like(targets_mix_soft)
+        targets_mix[targets_mix_soft > 0.3] = 1.0
+
+        #用软标签
+        # targets_mix = targets.view(n_grid, g, -1).max(dim=1)[0]
+
+        
         return inputs_mix, targets_mix, drop_ind
 
     def Smix_minimalism(self, X, Y):
