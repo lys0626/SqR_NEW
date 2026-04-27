@@ -294,12 +294,12 @@ class Engine(object):
 
 
         #这两行对验证集和测试集标签为-1的进行了修改，这是修改前的代码
-        # targets_gt = data.get('target_hard', data['target']).clone().to(self.rank)
-        # targets_gt[targets_gt == -1] = 0
+        targets_gt = data.get('target_hard', data['target']).clone().to(self.rank)
+        targets_gt[targets_gt == -1] = 0
 
 
         #这是修改后的代码,测试集对于-1不进行判定AUROC
-        targets_gt = data.get('target_hard', data['target']).clone().to(self.rank)
+        # targets_gt = data.get('target_hard', data['target']).clone().to(self.rank)
         return inputs, targets, targets_gt, file_name
 
     def on_end_batch(self, outputs, targets_gt, loss, image_name=''):
@@ -320,96 +320,7 @@ class Engine(object):
         self.epoch = epoch
         self.epoch_time = time.time()
         self.reset_meters()
-    def on_end_epoch(self, is_train, result, result_best=None, is_ema=False,eval_tag='Val'):
-        self.lr_curr = utils.get_learning_rate(self.optimizer)
-        self.epoch_time = time.time() - self.epoch_time
-        meter = self.meter
-        loss = meter['loss'].average()
-        
-        metrics_res = {}
-
-        if utils_ddp.is_main_process():
-            loss_all = meter['loss_all'].average()
-            
-            # --- 只有验证时计算全部医学指标 (mAUC, F1, etc.) ---
-            if not is_train:
-                metrics_res = meter['ap'].compute_all_metrics()
-            else:
-                metrics_res = {} 
-        else:
-            loss_all = torch.tensor(-1)
-            metrics_res = {}
-
-        if self.args.distributed:
-            utils_ddp.barrier()
-
-        # 记录基础数据
-        result['epoch'].append(self.epoch)
-        result['loss'].append(loss_all.item())
-        if 'mAUC' in metrics_res:
-            result['mAUC'].append(metrics_res['mAUC'])
-        if 'micro_F1' in metrics_res:
-            result['micro_F1'].append(metrics_res['micro_F1'])
-
-        is_best = False
-        
-        # --- 格式化日志字符串 ---
-        str_metrics = ""
-        # 定义日志前缀
-        # log_tag = "Train" if is_train else ("EMA-Test" if is_ema else "Test")
-        log_tag = "Train" if is_train else eval_tag
-        if not is_train and 'mAUC' in metrics_res:
-            str_metrics = (
-                f"mAUC: {metrics_res['mAUC']:.4f}, "
-                f"miF1: {metrics_res['micro_F1']:.4f}, maF1: {metrics_res['macro_F1']:.4f}, "
-                f"miR: {metrics_res['micro_R']:.4f}, maR: {metrics_res['macro_R']:.4f}"
-            )
-            
-            # --- 打印每个具体疾病类别的 AUROC (Per-Class) ---
-            if 'auc_list' in metrics_res:
-                auc_list = metrics_res['auc_list']
-                # 尝试从 dataset 中获取疾病名称，增加 EMA 模式下的容错
-                target_ds = self.dataset['test']
-                class_names = getattr(target_ds, 'classes', [f"Class_{i}" for i in range(len(auc_list))])
-                
-                per_class_str = ", ".join([
-                    f"{name}: {auc:.4f}" if auc != -1.0 else f"{name}: N/A" 
-                    for name, auc in zip(class_names, auc_list)
-                ])
-                self.logger.info(f"[{log_tag} Per-Class AUC] {per_class_str}")
-
-        if isinstance(self.lr_curr, (list, tuple, np.ndarray)):
-            lr_str = "[" + ", ".join([f"{float(lr):.6f}" for lr in self.lr_curr]) + "]"
-        else:
-            lr_str = f"{float(self.lr_curr):.6f}"
-
-        # 打印 Epoch 总结日志 (加入 float(loss) 防止 loss 也是单个元素的 array 导致报错)
-        if is_train:
-            str_log = f'[Epoch {self.epoch}, lr: {lr_str}] [{log_tag}] time:{utils.strftime(self.epoch_time)}s, loss: {float(loss):.4f} .'
-        else:
-            str_log = f'[{log_tag}] time: {utils.strftime(self.epoch_time)}s, loss: {float(loss):.4f}, {str_metrics} .'
-        
-        self.logger.info(str_log)
-
-        # --- Best Model 判定 (基于 mAUC) ---
-        if not is_train:
-            current_mAUC = metrics_res.get('mAUC', 0.0)
-            if result_best['mAUC'] < current_mAUC:
-                is_best = True
-                result_best['mAUC'] = current_mAUC
-                result_best['epoch'] = self.epoch
-                result_best['loss'] = loss
-                result_best['metrics'] = metrics_res
-
-            str_best = f"--[{log_tag}-best] (E{result_best['epoch']}), mAUC: {result_best['mAUC']:.4f}"
-            self.logger.info(str_best)
-
-        if not is_train and self.args.evaluate != 0 and utils_ddp.is_main_process():
-            if 'Val' in eval_tag: 
-                self.save_checkpoint(is_best=is_best, is_ema=is_ema)
-        if self.args.distributed:
-            utils_ddp.barrier()
-    # def on_end_epoch(self, is_train, result, result_best=None,is_ema=False):
+    # def on_end_epoch(self, is_train, result, result_best=None, is_ema=False,eval_tag='Val'):
     #     self.lr_curr = utils.get_learning_rate(self.optimizer)
     #     self.epoch_time = time.time() - self.epoch_time
     #     meter = self.meter
@@ -420,12 +331,11 @@ class Engine(object):
     #     if utils_ddp.is_main_process():
     #         loss_all = meter['loss_all'].average()
             
-    #         # --- 核心修改：使用 compute_all_metrics ---
+    #         # --- 只有验证时计算全部医学指标 (mAUC, F1, etc.) ---
     #         if not is_train:
-    #             # 只有验证时计算
     #             metrics_res = meter['ap'].compute_all_metrics()
     #         else:
-    #             metrics_res = {} # 训练时不计算
+    #             metrics_res = {} 
     #     else:
     #         loss_all = torch.tensor(-1)
     #         metrics_res = {}
@@ -433,48 +343,56 @@ class Engine(object):
     #     if self.args.distributed:
     #         utils_ddp.barrier()
 
+    #     # 记录基础数据
     #     result['epoch'].append(self.epoch)
     #     result['loss'].append(loss_all.item())
     #     if 'mAUC' in metrics_res:
     #         result['mAUC'].append(metrics_res['mAUC'])
+    #     if 'micro_F1' in metrics_res:
+    #         result['micro_F1'].append(metrics_res['micro_F1'])
 
     #     is_best = False
         
-    #     # --- 格式化日志字符串 (新格式) ---
+    #     # --- 格式化日志字符串 ---
     #     str_metrics = ""
-    #     log_tag = "Train" if is_train else ("EMA-Test" if is_ema else "Test")
+    #     # 定义日志前缀
+    #     # log_tag = "Train" if is_train else ("EMA-Test" if is_ema else "Test")
+    #     log_tag = "Train" if is_train else eval_tag
     #     if not is_train and 'mAUC' in metrics_res:
     #         str_metrics = (
     #             f"mAUC: {metrics_res['mAUC']:.4f}, "
     #             f"miF1: {metrics_res['micro_F1']:.4f}, maF1: {metrics_res['macro_F1']:.4f}, "
-    #             f"miP: {metrics_res['micro_P']:.4f}, maP: {metrics_res['macro_P']:.4f}, "
     #             f"miR: {metrics_res['micro_R']:.4f}, maR: {metrics_res['macro_R']:.4f}"
     #         )
-    #         # --- 新增：提取并打印每个具体疾病类别的 AUROC ---
+            
+    #         # --- 打印每个具体疾病类别的 AUROC (Per-Class) ---
     #         if 'auc_list' in metrics_res:
     #             auc_list = metrics_res['auc_list']
-    #             # 从 dataset 中获取疾病名称列表，做好容错处理
-    #             if hasattr(self.dataset['test'], 'classes'):
-    #                 class_names = self.dataset['test'].classes
-    #             else:
-    #                 class_names = [f"Class_{i}" for i in range(len(auc_list))]
+    #             # 尝试从 dataset 中获取疾病名称，增加 EMA 模式下的容错
+    #             target_ds = self.dataset['test']
+    #             class_names = getattr(target_ds, 'classes', [f"Class_{i}" for i in range(len(auc_list))])
                 
-    #             # 将疾病名称与对应的 AUC 拼接成字符串
     #             per_class_str = ", ".join([
     #                 f"{name}: {auc:.4f}" if auc != -1.0 else f"{name}: N/A" 
     #                 for name, auc in zip(class_names, auc_list)
     #             ])
-    #             # 打印详细的 Per-Class AUC
-    #             self.logger.info(f"[Per-Class AUC] {per_class_str}")
+    #             self.logger.info(f"[{log_tag} Per-Class AUC] {per_class_str}")
 
-    #     if is_train:
-    #         str_log = f'[Epoch {self.epoch}, lr{self.lr_curr}] [Train] time:{utils.strftime(self.epoch_time)}s, loss: {loss:.4f} .'
-    #         self.logger.info(str_log)
+    #     if isinstance(self.lr_curr, (list, tuple, np.ndarray)):
+    #         lr_str = "[" + ", ".join([f"{float(lr):.6f}" for lr in self.lr_curr]) + "]"
     #     else:
-    #         str_log = f'[Test] time: {utils.strftime(self.epoch_time)}s, loss: {loss:.4f}, {str_metrics} .'
-    #         self.logger.info(str_log)
+    #         lr_str = f"{float(self.lr_curr):.6f}"
 
-    #         # Best Model 判定
+    #     # 打印 Epoch 总结日志 (加入 float(loss) 防止 loss 也是单个元素的 array 导致报错)
+    #     if is_train:
+    #         str_log = f'[Epoch {self.epoch}, lr: {lr_str}] [{log_tag}] time:{utils.strftime(self.epoch_time)}s, loss: {float(loss):.4f} .'
+    #     else:
+    #         str_log = f'[{log_tag}] time: {utils.strftime(self.epoch_time)}s, loss: {float(loss):.4f}, {str_metrics} .'
+        
+    #     self.logger.info(str_log)
+
+    #     # --- Best Model 判定 (基于 mAUC) ---
+    #     if not is_train:
     #         current_mAUC = metrics_res.get('mAUC', 0.0)
     #         if result_best['mAUC'] < current_mAUC:
     #             is_best = True
@@ -483,14 +401,96 @@ class Engine(object):
     #             result_best['loss'] = loss
     #             result_best['metrics'] = metrics_res
 
-    #         str_best = f"--[Test-best] (E{result_best['epoch']}), mAUC: {result_best['mAUC']:.4f}"
+    #         str_best = f"--[{log_tag}-best] (E{result_best['epoch']}), mAUC: {result_best['mAUC']:.4f}"
     #         self.logger.info(str_best)
 
-    #     if self.args.evaluate != 0 and utils_ddp.is_main_process():
-    #         self.save_checkpoint(is_train, is_best, is_ema=is_ema)
-            
+    #     if not is_train and self.args.evaluate != 0 and utils_ddp.is_main_process():
+    #         if 'Val' in eval_tag: 
+    #             self.save_checkpoint(is_best=is_best, is_ema=is_ema)
     #     if self.args.distributed:
     #         utils_ddp.barrier()
+    def on_end_epoch(self, is_train, result, result_best=None,is_ema=False):
+        self.lr_curr = utils.get_learning_rate(self.optimizer)
+        self.epoch_time = time.time() - self.epoch_time
+        meter = self.meter
+        loss = meter['loss'].average()
+        
+        metrics_res = {}
+
+        if utils_ddp.is_main_process():
+            loss_all = meter['loss_all'].average()
+            
+            # --- 核心修改：使用 compute_all_metrics ---
+            if not is_train:
+                # 只有验证时计算
+                metrics_res = meter['ap'].compute_all_metrics()
+            else:
+                metrics_res = {} # 训练时不计算
+        else:
+            loss_all = torch.tensor(-1)
+            metrics_res = {}
+
+        if self.args.distributed:
+            utils_ddp.barrier()
+
+        result['epoch'].append(self.epoch)
+        result['loss'].append(loss_all.item())
+        if 'mAUC' in metrics_res:
+            result['mAUC'].append(metrics_res['mAUC'])
+
+        is_best = False
+        
+        # --- 格式化日志字符串 (新格式) ---
+        str_metrics = ""
+        log_tag = "Train" if is_train else ("EMA-Test" if is_ema else "Test")
+        if not is_train and 'mAUC' in metrics_res:
+            str_metrics = (
+                f"mAUC: {metrics_res['mAUC']:.4f}, "
+                f"miF1: {metrics_res['micro_F1']:.4f}, maF1: {metrics_res['macro_F1']:.4f}, "
+                f"miP: {metrics_res['micro_P']:.4f}, maP: {metrics_res['macro_P']:.4f}, "
+                f"miR: {metrics_res['micro_R']:.4f}, maR: {metrics_res['macro_R']:.4f}"
+            )
+            # --- 新增：提取并打印每个具体疾病类别的 AUROC ---
+            if 'auc_list' in metrics_res:
+                auc_list = metrics_res['auc_list']
+                # 从 dataset 中获取疾病名称列表，做好容错处理
+                if hasattr(self.dataset['test'], 'classes'):
+                    class_names = self.dataset['test'].classes
+                else:
+                    class_names = [f"Class_{i}" for i in range(len(auc_list))]
+                
+                # 将疾病名称与对应的 AUC 拼接成字符串
+                per_class_str = ", ".join([
+                    f"{name}: {auc:.4f}" if auc != -1.0 else f"{name}: N/A" 
+                    for name, auc in zip(class_names, auc_list)
+                ])
+                # 打印详细的 Per-Class AUC
+                self.logger.info(f"[Per-Class AUC] {per_class_str}")
+
+        if is_train:
+            str_log = f'[Epoch {self.epoch}, lr{self.lr_curr}] [Train] time:{utils.strftime(self.epoch_time)}s, loss: {loss:.4f} .'
+            self.logger.info(str_log)
+        else:
+            str_log = f'[Test] time: {utils.strftime(self.epoch_time)}s, loss: {loss:.4f}, {str_metrics} .'
+            self.logger.info(str_log)
+
+            # Best Model 判定
+            current_mAUC = metrics_res.get('mAUC', 0.0)
+            if result_best['mAUC'] < current_mAUC:
+                is_best = True
+                result_best['mAUC'] = current_mAUC
+                result_best['epoch'] = self.epoch
+                result_best['loss'] = loss
+                result_best['metrics'] = metrics_res
+
+            str_best = f"--[Test-best] (E{result_best['epoch']}), mAUC: {result_best['mAUC']:.4f}"
+            self.logger.info(str_best)
+
+        if self.args.evaluate != 0 and utils_ddp.is_main_process():
+            self.save_checkpoint(is_train, is_best, is_ema=is_ema)
+            
+        if self.args.distributed:
+            utils_ddp.barrier()
 
     # --- save_checkpoint ---
     def save_checkpoint(self, is_best, is_ema=False):
