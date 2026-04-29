@@ -44,7 +44,7 @@ else
     METHOD_SUFFIX="baseline"        # <--- 新增 (对应 engine.py) 
 fi
 
-WEIGHTS_PATH="/data/dsj/lys/SqR-NEW/experiment/4_26_BCE_MAX_>0.3_4_25_DinoV2_2_3_4_0.995_old/mimic/stage2_splicemix-cl/MIMIC/SpliceMix_CL/ChkpotBest_EMA_SpliceMix_CL.pt"
+WEIGHTS_PATH="/data/dsj/lys/SqR-NEW/experiment/soft_stage2/4_25_new_cl/4_21_DinoV2_NEW_round_ASL_label_3_3_3_0.995__0.985_old/mimic/stage2_splicemix-cl/MIMIC/SpliceMix_CL/ChkpotBest_EMA_SpliceMix_CL.pt"
 echo "==================================================="
 echo "  启动测试评估模式 (Evaluate Only) "
 echo "  ==> 评估方法: ${STAGE2_METHOD}"
