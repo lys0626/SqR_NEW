@@ -11,9 +11,9 @@ from utilities_s2.voc import VOC2007, VOC2012
 from utilities_s2 import utils_ddp
 import torch.distributed as dist
 from utilities_s2.nih import nihchest
-from utilities_s2.mimic import mimic # 假设类名是 mimic
-from utilities_s2.chexpert import chexpert # 假设类名是 chexpert
+from utilities_s2.mimic import mimic 
 from torch.utils.data import Subset
+from utilities_s2.chexpert import chexpert 
 opj = os.path.join
 
 def init(args):
@@ -142,6 +142,18 @@ def get_dataset(args):
     # --- MODIFIED: 合并了 MIMIC 和 CHEXPERT 的逻辑
     elif args.data_set in ('MIMIC'):
         data_dir = args.data_root # 假设根目录设置正确
+        if args.is_train:
+            # 训练模式：同时加载 Train, Val 和 Test
+            train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
+            val_set = data_dict[args.data_set](data_dir, mode='valid', transform=test_transfm)
+            test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm)
+        else:
+            # 纯测试模式：只加载 Train (占位) 和 Test
+            print(f"!!! [Evaluation Mode] Loading TEST dataset for {args.data_set} !!!")
+            train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
+            test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm)
+    elif args.data_set in ('CHEXPERT'):
+        data_dir = args.data_root
         if args.is_train:
             # 训练模式：同时加载 Train, Val 和 Test
             train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)

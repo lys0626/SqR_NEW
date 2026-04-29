@@ -331,6 +331,24 @@ class Engine(object):
             # --- 只有验证时计算全部医学指标 (mAUC, F1, etc.) ---
             if not is_train:
                 metrics_res = meter['ap'].compute_all_metrics()
+                # ========================================================
+                # 🌟 [核心修改 1]: 只在 CheXpert 数据集上，通过 auc_list 提取 mAUC_5
+                # ========================================================
+                if self.args.data_set == 'CHEXPERT' and 'auc_list' in metrics_res:
+                    auc_list = metrics_res['auc_list']
+                    
+                    # ⚠️ 安全防御：确保当前真的是 13 类任务，防止错位
+                    if len(auc_list) == 13:
+                        core_5_idx = [1, 4, 5, 7, 9]
+                        core_5_aucs = [auc_list[i] for i in core_5_idx if auc_list[i] != -1.0]
+                        metrics_res['mAUC_5'] = np.mean(core_5_aucs) if core_5_aucs else 0.0
+                    elif len(auc_list) == 14:
+                        # 兼容你偶尔想要跑 14 类的测试情况
+                        core_5_idx = [2, 5, 6, 8, 10]
+                        core_5_aucs = [auc_list[i] for i in core_5_idx if auc_list[i] != -1.0]
+                        metrics_res['mAUC_5'] = np.mean(core_5_aucs) if core_5_aucs else 0.0
+                    else:
+                        metrics_res['mAUC_5'] = metrics_res['mAUC'] # 异常兜底
             else:
                 metrics_res = {} 
         else:
@@ -356,11 +374,15 @@ class Engine(object):
         # log_tag = "Train" if is_train else ("EMA-Test" if is_ema else "Test")
         log_tag = "Train" if is_train else eval_tag
         if not is_train and 'mAUC' in metrics_res:
-            str_metrics = (
-                f"mAUC: {metrics_res['mAUC']:.4f}, "
-                f"miF1: {metrics_res['micro_F1']:.4f}, maF1: {metrics_res['macro_F1']:.4f}, "
-                f"miR:  {metrics_res['micro_R']:.4f}, maR: {metrics_res['macro_R']:.4f}"
-                f"miP:  {metrics_res['micro_P']:.4f}, maP: {metrics_res['macro_P']:.4f}"
+            # 🌟 [核心修改 2]: 动态决定日志打印内容
+            if self.args.data_set == 'CHEXPERT':
+                str_metrics = f"mAUC_13(Global): {metrics_res['mAUC']:.4f}, mAUC_5(Core): {metrics_res.get('mAUC_5', 0):.4f}, "
+            else:
+                str_metrics = f"mAUC: {metrics_res['mAUC']:.4f}, "
+            str_metrics += (
+                f"miF1: {metrics_res.get('micro_F1', 0):.4f}, maF1: {metrics_res.get('macro_F1', 0):.4f}, "
+                f"miR:  {metrics_res.get('micro_R', 0):.4f}, maR: {metrics_res.get('macro_R', 0):.4f}, " 
+                f"miP:  {metrics_res.get('micro_P', 0):.4f}, maP: {metrics_res.get('macro_P', 0):.4f}"
             )
             
             # --- 打印每个具体疾病类别的 AUROC (Per-Class) ---
@@ -390,16 +412,24 @@ class Engine(object):
         self.logger.info(str_log)
 
         # --- Best Model 判定 (基于 mAUC) ---
+        # ========================================================
+        # 🌟 [核心修改 3]: Best Model 判定 (CheXpert 强制看 mAUC_5)
+        # ========================================================
         if not is_train:
-            current_mAUC = metrics_res.get('mAUC', 0.0)
-            if result_best['mAUC'] < current_mAUC:
+            if self.args.data_set == 'CHEXPERT':
+                current_target_auc = metrics_res.get('mAUC_5', 0.0)
+                best_metric_name = "mAUC_5"
+            else:
+                current_target_auc = metrics_res.get('mAUC', 0.0)
+                best_metric_name = "mAUC"
+            if result_best['mAUC'] < current_target_auc:
                 is_best = True
-                result_best['mAUC'] = current_mAUC
+                result_best['mAUC'] = current_target_auc
                 result_best['epoch'] = self.epoch
                 result_best['loss'] = loss
                 result_best['metrics'] = metrics_res
 
-            str_best = f"--[{log_tag}-best] (E{result_best['epoch']}), mAUC: {result_best['mAUC']:.4f}"
+            str_best = f"--[{log_tag}-best] (E{result_best['epoch']}), {best_metric_name}: {result_best['mAUC']:.4f}"
             self.logger.info(str_best)
 
         if not is_train and self.args.evaluate != 0 and utils_ddp.is_main_process():

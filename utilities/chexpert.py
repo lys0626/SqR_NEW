@@ -1,214 +1,101 @@
-import json
 import os
-from glob import glob
-from itertools import chain
-
 import numpy as np
 from PIL import Image
 import pandas as pd
-import torch # <--- 确保 torch 已导入
 from torch.utils.data import Dataset
 
-# 确保这个导入路径相对于您的项目结构是正确的
-def load_json(file_path):
-    with open(file_path, 'rt') as f:
-        return json.load(f)
-
 class chexpert(Dataset):
-    """
-    [已修改以兼容 SpliceMix 项目架构]
-    """
     task = 'multilabel'
+    num_labels = 13
     
-    # 注意: num_labels = 5 在 __init__ 中被 train_cols (长度为5) 隐式确认
-    # 但 get_number_classes() 会返回 self.select_cols 的实际长度
+    # 严格按照你提供的 CSV 表头顺序定义 14 个病理标签
+    label_names = [
+        'Enlarged Cardiomediastinum', 'Cardiomegaly', 'Lung Opacity', 
+        'Lung Lesion', 'Edema', 'Consolidation', 'Pneumonia', 'Atelectasis', 
+        'Pneumothorax', 'Pleural Effusion', 'Pleural Other', 'Fracture', 'Support Devices'
+    ]
 
-    def __init__(self,
-                 root='',
-                 mode='train',
-                 transform=None,
-                 class_index=-1,
-                 use_frontal=True,
-                 use_upsampling=False,
-                 flip_label=False,
-                 verbose=False,
-                 upsampling_cols=['Cardiomegaly', 'Consolidation'],
-                 train_cols=['Cardiomegaly', 'Edema', 'Consolidation', 'Atelectasis', 'Pleural Effusion'],
-                 **kwargs,
-                 ):
-
-        # --- [原始 __init__ 逻辑保持不变] ---
-        
-        # change test to valid b.c. no test split is reserved.
-        # 确定要加载的 .csv 文件的名称
-        filename_mode = mode
-        if mode == 'test':
-            mode = 'valid'  # 内部逻辑使用 'valid'
-            filename_mode = 'test' # 但加载 'test.csv'
-        elif mode == 'valid':
-            # filename_mode = 'valid' # (原始代码) 为 'valid' 模式加载 'val.csv'
-            # [!! 已修改 !!] 强制 'valid' 模式也加载 'test.csv'
-            # 这符合 utils.py [cite: lys0626/resnet101/resnet101-fabe7a57d78a8cc899f4b7eb4d0e5558989465d2/utilities/utils.py] 中 'CHEXPERT' 的验证逻辑
-            filename_mode = 'test'  
-
-        # load data from csv
-        self.classes = train_cols
-        self.df = pd.read_csv(os.path.join(root, f'{filename_mode}.csv'))
-        self.df['Path'] = self.df['Path'].str.replace('CheXpert-v1.0-small/', '', regex=False)
-        self.df['Path'] = self.df['Path'].str.replace('CheXpert-v1.0/', '', regex=False)
-        if filename_mode == 'test':
-            self.df['Path'] = self.df['Path'].str.replace('valid/', 'test/', regex=False)
-        # upsample selected cols
-        if use_upsampling:
-            assert isinstance(upsampling_cols, list), 'Input should be list!'
-            sampled_df_list = []
-            for col in upsampling_cols:
-                print('Upsampling %s...' % col)
-                sampled_df_list.append(self.df[self.df[col] == 1])
-            self.df = pd.concat([self.df] + sampled_df_list, axis=0)
-
-        # impute missing values
-        for col in train_cols:
-            if col in ['Edema', 'Atelectasis']:
-                self.df[col].replace(-1, 1, inplace=True)
-                self.df[col].fillna(0, inplace=True)
-            elif col in ['Cardiomegaly', 'Consolidation', 'Pleural Effusion']:
-                self.df[col].replace(-1, 0, inplace=True)
-                self.df[col].fillna(0, inplace=True)
-            elif col in ['No Finding', 'Enlarged Cardiomediastinum', 'Lung Opacity', 'Lung Lesion', 'Pneumonia',
-                         'Pneumothorax', 'Pleural Other', 'Fracture', 'Support Devices']:  # other labels
-                self.df[col].replace(-1, 0, inplace=True)
-                self.df[col].fillna(0, inplace=True)
-            else:
-                self.df[col].fillna(0, inplace=True)
-
-        self._num_images = len(self.df)
-
-        if flip_label and class_index != -1:  # In multi-class mode we disable this option!
-            self.df.replace(0, -1, inplace=True)
-
-        assert root != '', 'You need to pass the correct location for the dataset!'
-
-        if class_index == -1:  # 5 classes
-            if verbose:
-                print('Multi-label mode: True, Number of classes: [%d]' % len(train_cols))
-                print('-' * 30)
-            self.select_cols = train_cols
-            self.value_counts_dict = {}
-            for class_key, select_col in enumerate(train_cols):
-                class_value_counts_dict = self.df[select_col].value_counts().to_dict()
-                self.value_counts_dict[class_key] = class_value_counts_dict
-        else:
-            self.select_cols = [train_cols[class_index]]  # this var determines the number of classes
-            self.value_counts_dict = self.df[self.select_cols[0]].value_counts().to_dict()
-
-        self.class_index = class_index
+    def __init__(self, root='/data/chexpert_224', mode='train', transform=None):
+        self.root = root
         self.transform = transform
+        self.mode = mode
 
-        self._images_list = [os.path.join(root, path) for path in self.df['Path'].tolist()]
-        if class_index != -1:
-            self.targets = self.df[train_cols].values[:, class_index].tolist()
+        # 1. 定位 CSV 文件
+        if mode == 'train':
+            csv_file = 'train_8.csv' # 或者你的 train_8.csv
+        elif mode == 'valid':
+            csv_file = 'valid_2.csv'
+        elif mode == 'test':
+            csv_file = 'test_processed.csv' 
         else:
-            self.targets = self.df[train_cols].values.tolist()
+            raise ValueError(f"Unknown mode: {mode}")
 
-        if verbose:
-            if class_index != -1:
-                if flip_label:
-                    self.imratio = self.value_counts_dict[1] / (self.value_counts_dict[-1] + self.value_counts_dict[1])
-                    if verbose:
-                        print('-' * 30)
-                        print('Found %s images in total, %s positive images, %s negative images' % (
-                        self._num_images, self.value_counts_dict[1], self.value_counts_dict[-1]))
-                        print('%s(C%s): imbalance ratio is %.4f' % (self.select_cols[0], class_index, self.imratio))
-                        print('-' * 30)
-                else:
-                    self.imratio = self.value_counts_dict[1] / (self.value_counts_dict[0] + self.value_counts_dict[1])
-                    if verbose:
-                        print('-' * 30)
-                        print('Found %s images in total, %s positive images, %s negative images' % (
-                        self._num_images, self.value_counts_dict[1], self.value_counts_dict[0]))
-                        print('%s(C%s): imbalance ratio is %.4f' % (self.select_cols[0], class_index, self.imratio))
-                        print('-' * 30)
+        csv_path = os.path.join(self.root, csv_file)
+        
+        if not os.path.exists(csv_path):
+             raise FileNotFoundError(f"CSV file not found: {csv_path}")
+        
+        print(f"Loading CheXpert dataset from {csv_path}...")
+        self.df = pd.read_csv(csv_path)
+
+        # 2. 直接提取 14 列预处理好的干净标签 (全部是 0.0 或 1.0)
+        labels_np = self.df[self.label_names].values.astype(np.float32)
+
+        # 3. 准备数据列表
+        self.image_paths = []
+        self.labels = []
+        missing_count = 0
+        
+        for idx, row in self.df.iterrows():
+            # 直接读取干净的 Path，例如 'train/patient00001/study1/view1_frontal.jpg'
+            raw_path = str(row['Path'])
+            
+            final_path = os.path.join(self.root, raw_path)
+            
+            if os.path.exists(final_path):
+                self.image_paths.append(final_path)
+                self.labels.append(labels_np[idx])
             else:
-                imratio_list = []
-                for class_key, select_col in enumerate(train_cols):
-                    try:
-                        imratio = self.value_counts_dict[class_key][1] / (
-                                    self.value_counts_dict[class_key][0] + self.value_counts_dict[class_key][1])
-                    except:
-                        if len(self.value_counts_dict[class_key]) == 1:
-                            only_key = list(self.value_counts_dict[class_key].keys())[0]
-                            if only_key == 0:
-                                self.value_counts_dict[class_key][1] = 0
-                                imratio = 0  # no postive samples
-                            else:
-                                self.value_counts_dict[class_key][1] = 0
-                                imratio = 1  # no negative samples
+                missing_count += 1
+                if missing_count < 5: 
+                     print(f"Warning: Image not found: {final_path}")
 
-                    imratio_list.append(imratio)
-                    if verbose:
-                        print('Found %s images in total, %s positive images, %s negative images' % (
-                        self._num_images, self.value_counts_dict[class_key][1], self.value_counts_dict[class_key][0]))
-                        print('%s(C%s): imbalance ratio is %.4f' % (select_col, class_key, imratio))
-                        print()
-                self.imratio = np.mean(imratio_list)
-                self.imratio_list = imratio_list
+        if missing_count > 0:
+            print(f"Total missing images in {mode} set: {missing_count}")
+        else:
+            print(f"Successfully loaded {len(self.image_paths)} images for {mode}.")
 
-        pos_ratio = np.array(self.targets).mean(axis=0)
-        self.weight = np.stack([pos_ratio, 1 - pos_ratio], axis=1)
-        self.norm_weight = None
+        self.y = np.array(self.labels)
+        self.classes = self.label_names
 
-    # --- [修改开始] ---
-    
+        # 计算权重 (Stage 1 可选使用)
+        if len(self.y) > 0:
+            pos_counts = np.sum(self.y, axis=0)
+            neg_counts = len(self.y) - pos_counts
+            pos_counts = np.where(pos_counts == 0, 1, pos_counts)
+            neg_counts = np.where(neg_counts == 0, 1, neg_counts)
+            self.weight = np.stack([1.0 / neg_counts, 1.0 / pos_counts], axis=1)
+        else:
+            self.weight = np.ones((len(self.classes), 2))
+
     def get_number_classes(self):
-        """
-        返回数据集中的标签总数。
-        utils.py [cite: lys0626/resnet101/resnet101-fabe7a57d78a8cc899f4b7eb4d0e5558989465d2/utilities/utils.py] 中的 get_dataset [cite: lys0626/resnet101/resnet101-fabe7a57d78a8cc899f4b7eb4d0e5558989465d2/utilities/utils.py] 会调用此方法。
-        (此逻辑基于您原始文件中的 @property num_classes)
-        """
-        return len(self.select_cols)
-
-    # (删除了 @property 装饰器的方法, 因为它们不再需要)
+        return self.num_labels
 
     def __len__(self):
-        return self._num_images
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        """
-        获取单个数据样本。
-        [已修改] 返回 engine.py [cite: lys0626/resnet101/resnet101-fabe7a57d78a8cc899f4b7eb4d0e5558989465d2/engine.py] 期望的字典格式。
-        """
-        img_path = self._images_list[idx]
+        img_path = self.image_paths[idx]
+        label = self.labels[idx]
+        
         try:
-            # 1. 强制转换为 'RGB' 以匹配 ResNet101 [cite: lys0626/resnet101/resnet101-fabe7a57d78a8cc899f4b7eb4d0e5558989465d2/models/ResNet_101.py] 的 3 通道输入
             image = Image.open(img_path).convert('RGB')
-
-            if self.transform:
-                image = self.transform(image)
-            
-            # 2. 获取标签 (逻辑与您的原始代码相同)
-            if self.class_index != -1:  # multi-class mode
-                label = np.array(self.targets[idx]).reshape(-1).astype(np.float32)
-            else:
-                label = np.array(self.targets[idx]).reshape(-1).astype(np.float32)
-            
-            # 3. 获取文件名
-            filename = os.path.basename(img_path)
-
-            # 4. 返回 engine.py [cite: lys0626/resnet101/resnet101-fabe7a57d78a8cc899f4b7eb4d0e5558989465d2/engine.py] 期望的字典
-            data = {'image': image, 'target': label, 'name': filename}
-            return data
-
-        # 错误处理 (从 mimic.py [cite: lys0626/resnet101/resnet101-fabe7a57d78a8cc899f4b7eb4d0e5558989465d2/utilities/mimic.py] 借鉴)
-        except FileNotFoundError:
-            print(f"错误：图像文件未找到 {img_path}。正在跳过并加载下一个。")
-            next_idx = (idx + 1) % len(self) if len(self) > 0 else 0
-            if len(self) > 0: return self.__getitem__(next_idx)
-            else: raise IndexError("数据集为空或无法加载任何图像")
         except Exception as e:
-            print(f"加载图像 {img_path} 时出错：{e}。正在跳过并加载下一个。")
-            next_idx = (idx + 1) % len(self) if len(self) > 0 else 0
-            if len(self) > 0: return self.__getitem__(next_idx)
-            else: raise IndexError("数据集为空或无法加载任何图像")
-    
-    # --- [修改结束] ---
+            print(f"Error loading image {img_path}: {e}")
+            return self.__getitem__((idx + 1) % len(self))
+
+        if self.transform:
+            image = self.transform(image)
+            
+        # Stage 1 专用：返回图像, 标签, 和 idx (用于 FkL Mask)
+        return image, label, idx

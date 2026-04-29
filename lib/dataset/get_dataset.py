@@ -6,6 +6,7 @@ import os.path as osp
 # 引入 ResNet50 仓库的数据集类
 from utilities.mimic import mimic
 from utilities.nih import nihchest
+from utilities.chexpert import chexpert
 def get_datasets(args):
     #对输入数据标准化的两种方式。如果开启它，模型输入的是[0,1]范围内的数据。如果关闭它模型输入的就是经过imageNet统计数据标准化后的数据
     if args.orid_norm:
@@ -55,7 +56,7 @@ def get_datasets(args):
     elif args.dataname == 'mimic':
         train_dataset = mimic(root=args.dataset_dir, mode='train', transform=train_data_transform)
         if args.evaluate:
-            print("!!! [Evaluation Mode] Loading TEST dataset (cxr14_test.csv) !!!")
+            print("!!! [Evaluation Mode] Loading TEST dataset (mimic_test.csv) !!!")
             # 如果是 -e 模式，让 val_dataset 实际上加载测试集
             val_dataset = mimic(root=args.dataset_dir, mode='test', transform=test_data_transform)
         else:
@@ -73,6 +74,17 @@ def get_datasets(args):
             # 如果是训练模式，加载正常的验证集
             val_dataset = nihchest(root=args.dataset_dir, mode='valid', transform=test_data_transform)
         args.num_class = train_dataset.get_number_classes() # 自动设置类别数 (14)
+    elif args.dataname == 'chexpert':
+        train_dataset = chexpert(root=args.dataset_dir, mode='train', transform=train_data_transform)
+        if args.evaluate:
+            print("!!! [Evaluation Mode] Loading TEST dataset (chexpert_test.csv) !!!")
+            # 如果是 -e 模式，让 val_dataset 实际上加载测试集
+            val_dataset = chexpert(root=args.dataset_dir, mode='test', transform=test_data_transform)
+        else:
+            # 如果是训练模式，加载正常的验证集
+            val_dataset = chexpert(root=args.dataset_dir, mode='valid', transform=test_data_transform)
+        args.num_class = train_dataset.get_number_classes() 
+        # 注意：如果有测试集需求，也可以在此处实例化 test_dataset
     else:
         raise NotImplementedError("Unknown dataname %s" % args.dataname)
 

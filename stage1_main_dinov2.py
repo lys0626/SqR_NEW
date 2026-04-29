@@ -60,7 +60,7 @@ def sec_to_str(seconds):
 def parser_args():
     parser = argparse.ArgumentParser(description='DINOv2 NIH Training (Stage 1 - MEE Label-Level)')
     # == 原有基础参数 ==
-    parser.add_argument('--dataname', default='nih', choices=['coco14', 'mimic', 'nih'])
+    parser.add_argument('--dataname', default='nih', choices=['coco14', 'mimic', 'nih','chexpert'])
     parser.add_argument('--dataset_dir', default='/comp_robot')
     parser.add_argument('--img_size', default=224, type=int) # 注意：必须是 14 的倍数
     parser.add_argument('--output', metavar='DIR', help='path to output folder')
@@ -391,16 +391,16 @@ def pick_remove_rate_by_phase(rn, i1, i2, i3, r1, r2, r3, r4):
 
 def get_fkl_required_epochs(rn, i1, i2, i3):
     if rn <= i1:
-        return 2
+        return 1
     elif rn <= i1 + i2:
-        return 3
+        return 2
     elif rn <= i1 + i2 + i3:
         return 3
     else:
         return 4
 
 @torch.inference_mode()
-def validate_with_meter(models, val_loader, device):
+def validate_with_meter(models, val_loader, device,args):
     for m in models: 
         m.eval()
         
@@ -414,6 +414,21 @@ def validate_with_meter(models, val_loader, device):
         meter.add(logits.detach(), targets.detach())
         
     metrics_dict = meter.compute_all_metrics()
+    # ========================================================
+    # 🌟 新增: 专门为 CheXpert 计算核心 5 类指标
+    # ========================================================
+    if args.dataname == 'chexpert' and 'auc_list' in metrics_dict:
+        auc_list = metrics_dict['auc_list']
+        # 确保当前是 13 类设定
+        if len(auc_list) == 13:
+            core_5_idx = [1, 4, 5, 7, 9]
+            core_5_aucs = [auc_list[i] for i in core_5_idx if auc_list[i] != -1.0]
+            metrics_dict['mAUC_5'] = np.mean(core_5_aucs) if core_5_aucs else 0.0
+        # 兼容 14 类设定
+        elif len(auc_list) == 14:
+            core_5_idx = [2, 5, 6, 8, 10]
+            core_5_aucs = [auc_list[i] for i in core_5_idx if auc_list[i] != -1.0]
+            metrics_dict['mAUC_5'] = np.mean(core_5_aucs) if core_5_aucs else 0.0
     return metrics_dict
 
 def main():
@@ -533,18 +548,50 @@ def main():
             
             train_one_epoch_mutual_kd(net1, net2, ema1.ema_model, ema2.ema_model, ema1, ema2, opt1, opt2, train_loader, criterion, args, device, global_label_mask,sch1,sch2,epoch)
             
-            val_metrics = validate_with_meter(models, val_loader, device)
+            val_metrics = validate_with_meter(models, val_loader, device,args)
             
-            val_auroc = val_metrics.get('mAUC', 0.0)
+            # val_auroc = val_metrics.get('mAUC', 0.0)
+            # val_macro_f1 = val_metrics.get('macro_F1', 0.0)
+            
+            # logger.info(f"    -> Epoch {epoch + 1} Val mAUC: {val_auroc:.4f} | Macro F1: {val_macro_f1:.4f}")
+            
+            # if val_auroc > best_global_auroc:
+            #     best_global_auroc = val_auroc
+            #     best_ckpt_path = os.path.join(args.output, 'best_stage1_model.pth')
+                
+            #     logger.info(f"    >>> [Best Model] Saving new best model (mAUC: {best_global_auroc:.4f}) to {best_ckpt_path} <<<")
+            #     torch.save({
+            #         'round': round_num,
+            #         'epoch': epoch,
+            #         'net1': net1.state_dict(),
+            #         'net2': net2.state_dict(),
+            #         'net1_ema': ema1.ema_model.state_dict(),
+            #         'net2_ema': ema2.ema_model.state_dict(),
+            #         'best_auroc': best_global_auroc
+            #     }, best_ckpt_path)
+            # ========================================================
+            # 🌟 新增：动态获取目标分数并打印双规日志
+            # ========================================================
+            if args.dataname == 'chexpert':
+                current_val_score = val_metrics.get('mAUC_5', 0.0)
+                target_name = "mAUC_5 (Core)"
+                logger.info(f"    -> Epoch {epoch + 1} Val Global_mAUC: {val_metrics.get('mAUC', 0.0):.4f} | Core_mAUC_5: {current_val_score:.4f}")
+            else:
+                current_val_score = val_metrics.get('mAUC', 0.0)
+                target_name = "mAUC"
+                logger.info(f"    -> Epoch {epoch + 1} Val mAUC: {current_val_score:.4f}")
+
             val_macro_f1 = val_metrics.get('macro_F1', 0.0)
+            logger.info(f"    -> Epoch {epoch + 1} Macro F1: {val_macro_f1:.4f}")
             
-            logger.info(f"    -> Epoch {epoch + 1} Val mAUC: {val_auroc:.4f} | Macro F1: {val_macro_f1:.4f}")
-            
-            if val_auroc > best_global_auroc:
-                best_global_auroc = val_auroc
+            # ========================================================
+            # 🌟 修改：用 current_val_score (即 CheXpert 下的 mAUC_5) 进行竞争
+            # ========================================================
+            if current_val_score > best_global_auroc:
+                best_global_auroc = current_val_score
                 best_ckpt_path = os.path.join(args.output, 'best_stage1_model.pth')
                 
-                logger.info(f"    >>> [Best Model] Saving new best model (mAUC: {best_global_auroc:.4f}) to {best_ckpt_path} <<<")
+                logger.info(f"    >>> [Best Model] Saving new best model ({target_name}: {best_global_auroc:.4f}) to {best_ckpt_path} <<<")
                 torch.save({
                     'round': round_num,
                     'epoch': epoch,
@@ -552,9 +599,9 @@ def main():
                     'net2': net2.state_dict(),
                     'net1_ema': ema1.ema_model.state_dict(),
                     'net2_ema': ema2.ema_model.state_dict(),
-                    'best_auroc': best_global_auroc
+                    'best_auroc': best_global_auroc,
+                    'target_metric': target_name # 记录当前模型是靠哪个指标选出来的
                 }, best_ckpt_path)
-            
             if epoch >= args.warm_up_epochs:
                 logger.info("    -> Tracking LABEL-LEVEL predictions for FkL...")
                 
