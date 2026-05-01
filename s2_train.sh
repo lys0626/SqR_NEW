@@ -12,11 +12,11 @@ GPU_ID=1
 DATASET_NAME="chexpert"
 DATASET_NAME_UPPER="CHEXPERT"
 DATA_DIR="/data/chexpert_224"
-EXP_DIR="/data/dsj/lys/SqR-NEW/experiment/CHEXPERT_allclean_newmix"        # 实验输出的顶层根目录
+EXP_DIR="/data/dsj/lys/SqR-NEW/experiment/CHEXPERT_14/CHEXPERT_allclean_newmix"        # 实验输出的顶层根目录
 
 # ================= 2. 方法选择配置 =================
 # 可选值: "splicemix" 或 "splicemix-cl"，或 baseline
-STAGE2_METHOD="splicemix-cl"             
+STAGE2_METHOD="splicemix"             
 STAGE2_OUT="${EXP_DIR}/${DATASET_NAME}/stage2_${STAGE2_METHOD}"
 mkdir -p "${STAGE2_OUT}"
 #指定软标签的路径
@@ -46,7 +46,7 @@ python stage2_main.py \
   --model "${MODEL_ARG}" \
   -mixer "${MIXER_ARG}" \
   --epochs 100 \
-  --batch-size 128 \
+  --batch-size 32 \
   --optimizer SGD \
   --lr 0.05 \
   --warmup-epochs 5 \

@@ -6,13 +6,14 @@ from torch.utils.data import Dataset
 
 class chexpert(Dataset):
     task = 'multilabel'
-    num_labels = 13
+    num_labels = 14
     
     # 严格按照你提供的 CSV 表头顺序定义 14 个病理标签
     label_names = [
-        'Enlarged Cardiomediastinum', 'Cardiomegaly', 'Lung Opacity', 
-        'Lung Lesion', 'Edema', 'Consolidation', 'Pneumonia', 'Atelectasis', 
-        'Pneumothorax', 'Pleural Effusion', 'Pleural Other', 'Fracture', 'Support Devices'
+        'Enlarged Cardiomediastinum', 'Cardiomegaly', 'Lung Opacity',
+        'Lung Lesion', 'Edema', 'Consolidation', 'Pneumonia', 'Atelectasis',
+        'Pneumothorax', 'Pleural Effusion', 'Pleural Other', 'Fracture',
+        'Support Devices', 'No Finding'
     ]
 
     def __init__(self, root='/data/chexpert_224', mode='train', transform=None):
@@ -22,11 +23,11 @@ class chexpert(Dataset):
 
         # 1. 定位 CSV 文件
         if mode == 'train':
-            csv_file = 'train_8.csv' # 或者你的 train_8.csv
+            csv_file = 'train.csv' # 或者你的 train_8.csv
         elif mode == 'valid':
-            csv_file = 'valid_2.csv'
+            csv_file = 'valid.csv'
         elif mode == 'test':
-            csv_file = 'test_processed.csv' 
+            csv_file = 'test.csv' 
         else:
             raise ValueError(f"Unknown mode: {mode}")
 

@@ -109,9 +109,9 @@ def parser_args():
     parser.add_argument("--i_rate_3", type=int, default=0)
     parser.add_argument("--i_rate_4", type=int, default=0)
     
-    parser.add_argument("--remove_rate_1", type=float, default=0.995)
-    parser.add_argument("--remove_rate_2", type=float, default=0.995)
-    parser.add_argument("--remove_rate_3", type=float, default=0.995)
+    parser.add_argument("--remove_rate_1", type=float, default=0.9995)
+    parser.add_argument("--remove_rate_2", type=float, default=0.9995)
+    parser.add_argument("--remove_rate_3", type=float, default=0.9995)
     parser.add_argument("--remove_rate_4", type=float, default=0.995)
     args = parser.parse_args()
     return args
@@ -414,21 +414,6 @@ def validate_with_meter(models, val_loader, device,args):
         meter.add(logits.detach(), targets.detach())
         
     metrics_dict = meter.compute_all_metrics()
-    # ========================================================
-    # 🌟 新增: 专门为 CheXpert 计算核心 5 类指标
-    # ========================================================
-    if args.dataname == 'chexpert' and 'auc_list' in metrics_dict:
-        auc_list = metrics_dict['auc_list']
-        # 确保当前是 13 类设定
-        if len(auc_list) == 13:
-            core_5_idx = [1, 4, 5, 7, 9]
-            core_5_aucs = [auc_list[i] for i in core_5_idx if auc_list[i] != -1.0]
-            metrics_dict['mAUC_5'] = np.mean(core_5_aucs) if core_5_aucs else 0.0
-        # 兼容 14 类设定
-        elif len(auc_list) == 14:
-            core_5_idx = [2, 5, 6, 8, 10]
-            core_5_aucs = [auc_list[i] for i in core_5_idx if auc_list[i] != -1.0]
-            metrics_dict['mAUC_5'] = np.mean(core_5_aucs) if core_5_aucs else 0.0
     return metrics_dict
 
 def main():
@@ -572,21 +557,13 @@ def main():
             # ========================================================
             # 🌟 新增：动态获取目标分数并打印双规日志
             # ========================================================
-            if args.dataname == 'chexpert':
-                current_val_score = val_metrics.get('mAUC_5', 0.0)
-                target_name = "mAUC_5 (Core)"
-                logger.info(f"    -> Epoch {epoch + 1} Val Global_mAUC: {val_metrics.get('mAUC', 0.0):.4f} | Core_mAUC_5: {current_val_score:.4f}")
-            else:
-                current_val_score = val_metrics.get('mAUC', 0.0)
-                target_name = "mAUC"
-                logger.info(f"    -> Epoch {epoch + 1} Val mAUC: {current_val_score:.4f}")
-
+            
+            current_val_score = val_metrics.get('mAUC', 0.0)
+            target_name = "mAUC"
+            logger.info(f"    -> Epoch {epoch + 1} Val mAUC: {current_val_score:.4f}")
             val_macro_f1 = val_metrics.get('macro_F1', 0.0)
             logger.info(f"    -> Epoch {epoch + 1} Macro F1: {val_macro_f1:.4f}")
             
-            # ========================================================
-            # 🌟 修改：用 current_val_score (即 CheXpert 下的 mAUC_5) 进行竞争
-            # ========================================================
             if current_val_score > best_global_auroc:
                 best_global_auroc = current_val_score
                 best_ckpt_path = os.path.join(args.output, 'best_stage1_model.pth')

@@ -331,24 +331,6 @@ class Engine(object):
             # --- 只有验证时计算全部医学指标 (mAUC, F1, etc.) ---
             if not is_train:
                 metrics_res = meter['ap'].compute_all_metrics()
-                # ========================================================
-                # 🌟 [核心修改 1]: 只在 CheXpert 数据集上，通过 auc_list 提取 mAUC_5
-                # ========================================================
-                if self.args.data_set == 'CHEXPERT' and 'auc_list' in metrics_res:
-                    auc_list = metrics_res['auc_list']
-                    
-                    # ⚠️ 安全防御：确保当前真的是 13 类任务，防止错位
-                    if len(auc_list) == 13:
-                        core_5_idx = [1, 4, 5, 7, 9]
-                        core_5_aucs = [auc_list[i] for i in core_5_idx if auc_list[i] != -1.0]
-                        metrics_res['mAUC_5'] = np.mean(core_5_aucs) if core_5_aucs else 0.0
-                    elif len(auc_list) == 14:
-                        # 兼容你偶尔想要跑 14 类的测试情况
-                        core_5_idx = [2, 5, 6, 8, 10]
-                        core_5_aucs = [auc_list[i] for i in core_5_idx if auc_list[i] != -1.0]
-                        metrics_res['mAUC_5'] = np.mean(core_5_aucs) if core_5_aucs else 0.0
-                    else:
-                        metrics_res['mAUC_5'] = metrics_res['mAUC'] # 异常兜底
             else:
                 metrics_res = {} 
         else:
@@ -374,11 +356,7 @@ class Engine(object):
         # log_tag = "Train" if is_train else ("EMA-Test" if is_ema else "Test")
         log_tag = "Train" if is_train else eval_tag
         if not is_train and 'mAUC' in metrics_res:
-            # 🌟 [核心修改 2]: 动态决定日志打印内容
-            if self.args.data_set == 'CHEXPERT':
-                str_metrics = f"mAUC_13(Global): {metrics_res['mAUC']:.4f}, mAUC_5(Core): {metrics_res.get('mAUC_5', 0):.4f}, "
-            else:
-                str_metrics = f"mAUC: {metrics_res['mAUC']:.4f}, "
+            str_metrics = f"mAUC: {metrics_res['mAUC']:.4f}, "
             str_metrics += (
                 f"miF1: {metrics_res.get('micro_F1', 0):.4f}, maF1: {metrics_res.get('macro_F1', 0):.4f}, "
                 f"miR:  {metrics_res.get('micro_R', 0):.4f}, maR: {metrics_res.get('macro_R', 0):.4f}, " 
@@ -416,12 +394,8 @@ class Engine(object):
         # 🌟 [核心修改 3]: Best Model 判定 (CheXpert 强制看 mAUC_5)
         # ========================================================
         if not is_train:
-            if self.args.data_set == 'CHEXPERT':
-                current_target_auc = metrics_res.get('mAUC_5', 0.0)
-                best_metric_name = "mAUC_5"
-            else:
-                current_target_auc = metrics_res.get('mAUC', 0.0)
-                best_metric_name = "mAUC"
+            current_target_auc = metrics_res.get('mAUC', 0.0)
+            best_metric_name = "mAUC"
             if result_best['mAUC'] < current_target_auc:
                 is_best = True
                 result_best['mAUC'] = current_target_auc
