@@ -7,6 +7,7 @@ import os.path as osp
 from utilities.mimic import mimic
 from utilities.nih import nihchest
 from utilities.chexpert import chexpert
+from utilities.vinbigdata import VinBigDataDataset
 def get_datasets(args):
     #对输入数据标准化的两种方式。如果开启它，模型输入的是[0,1]范围内的数据。如果关闭它模型输入的就是经过imageNet统计数据标准化后的数据
     if args.orid_norm:
@@ -85,6 +86,25 @@ def get_datasets(args):
             val_dataset = chexpert(root=args.dataset_dir, mode='valid', transform=test_data_transform)
         args.num_class = train_dataset.get_number_classes() 
         # 注意：如果有测试集需求，也可以在此处实例化 test_dataset
+    elif args.dataname == 'vinbigdata':
+        train_dataset = VinBigDataDataset(
+            root=args.dataset_dir, 
+            mode='train', 
+            transform=train_data_transform,
+            inject_noise=args.inject_noise,
+            noise_type=args.noise_type,    # <--- 新增：传递噪声类型
+            sym_rate=args.sym_rate,        # <--- 新增：传递对称噪声率
+            fn_rate=args.fn_rate,          # 传递漏诊率
+            fp_rate=args.fp_rate           # 传递误诊率
+        )
+        if args.evaluate:
+            print("!!! [Evaluation Mode] Loading TEST dataset (chexpert_test.csv) !!!")
+            # 如果是 -e 模式，让 val_dataset 实际上加载测试集
+            val_dataset = VinBigDataDataset(root=args.dataset_dir, mode='test', transform=test_data_transform)
+        else:
+            # 如果是训练模式，加载正常的验证集
+            val_dataset = VinBigDataDataset(root=args.dataset_dir, mode='valid', transform=test_data_transform)
+        args.num_class = train_dataset.get_number_classes()
     else:
         raise NotImplementedError("Unknown dataname %s" % args.dataname)
 

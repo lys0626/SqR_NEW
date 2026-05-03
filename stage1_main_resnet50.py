@@ -12,7 +12,8 @@ import torch.nn.functional as F
 from torch.optim import lr_scheduler
 import torch.backends.cudnn as cudnn
 import torch.utils.data
-
+import torchvision
+import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 import csv
 from lib.dataset.get_dataset import get_datasets
@@ -91,7 +92,7 @@ def parser_args():
     parser.add_argument('--seed', default=95, type=int)
 
     # ================= 标签级 MEE 核心对齐参数 =================
-    parser.add_argument('--warm_up_epochs', default=6, type=int, help='前几个 Epoch 不记录 FkL')
+    parser.add_argument('--warm_up_epochs', default=0, type=int, help='前几个 Epoch 不记录 FkL')
     parser.add_argument('--fkl_consecutive_epochs', default=5, type=int, help='需要连续多少次预测正确才算候选干净标签')
     
     parser.add_argument('--early_cutting_rate', default=1.5, type=float)
@@ -106,13 +107,13 @@ def parser_args():
     # Phase 控制参数
     parser.add_argument("--i_rate_1", type=int, default=3)
     parser.add_argument("--i_rate_2", type=int, default=3)
-    parser.add_argument("--i_rate_3", type=int, default=0)
-    parser.add_argument("--i_rate_4", type=int, default=0)
+    parser.add_argument("--i_rate_3", type=int, default=3)
+    parser.add_argument("--i_rate_4", type=int, default=3)
     
-    parser.add_argument("--remove_rate_1", type=float, default=0.96)
-    parser.add_argument("--remove_rate_2", type=float, default=0.96)
-    parser.add_argument("--remove_rate_3", type=float, default=0.95)
-    parser.add_argument("--remove_rate_4", type=float, default=0.995)
+    parser.add_argument("--remove_rate_1", type=float, default=0.94)
+    parser.add_argument("--remove_rate_2", type=float, default=0.94)
+    parser.add_argument("--remove_rate_3", type=float, default=0.94)
+    parser.add_argument("--remove_rate_4", type=float, default=0.94)
 
    # ================= 替换这里的代码 =================
     parser.add_argument('--inject_noise', action='store_true', help='是否注入噪声')
@@ -399,13 +400,13 @@ def pick_remove_rate_by_phase(rn, i1, i2, i3, r1, r2, r3, r4):
 
 def get_fkl_required_epochs(rn, i1, i2, i3):
     if rn <= i1:
-        return 1
+        return 6
     elif rn <= i1 + i2:
-        return 2
+        return 6
     elif rn <= i1 + i2 + i3:
-        return 3
+        return 6
     else:
-        return 4
+        return 10
 
 @torch.inference_mode()
 def validate_with_meter(models, val_loader, device,args):
@@ -483,9 +484,27 @@ def main():
         logger.info(f"\n" + "="*20 + f" Starting Round {round_num}/{num_rounds} " + "="*20)
 
         # ======= 修改：将构建 Q2L 替换为构建 DINO =======
-        net1 = build_dino(args).to(device)
-        net2 = build_dino(args).to(device)
-        
+        # net1 = build_dino(args).to(device)
+        # net2 = build_dino(args).to(device)
+        print(f"=> 正在构建 Backbone: ResNet-50 (Pretrained on ImageNet)")
+        try:
+            # 完美修复：全部使用 torchvision.models 前缀
+            weights = torchvision.models.ResNet50_Weights.DEFAULT
+            net1 = torchvision.models.resnet50(weights=weights)
+            net2 = torchvision.models.resnet50(weights=weights)
+        except Exception as e:
+            # 养成好习惯，把异常打印出来看看，而不是默默吞掉
+            print(f"新版权重加载失败 ({e})，回退到 pretrained=True")
+            net1 = torchvision.models.resnet50(pretrained=True)
+            net2 = torchvision.models.resnet50(pretrained=True)
+        num_ftrs1 = net1.fc.in_features
+        num_ftrs2 = net2.fc.in_features
+        net1.fc = nn.Linear(num_ftrs1, args.num_class)
+        net2.fc = nn.Linear(num_ftrs2, args.num_class)
+        # ================= 关键修复：把模型推送到显卡上 =================
+        net1 = net1.to(device)
+        net2 = net2.to(device)
+        # ================================================================
         # # ==========================================
         # # 🌟 进阶修复：表征继承 + 决策头重置 (Head Reset)
         # # ==========================================
@@ -610,7 +629,7 @@ def main():
                 logger.info(f"    -> Current FkL Candidates: {current_fkl_count} (Dynamic Threshold: {dynamic_threshold})")
                 logger.info(f"    -> Current pool size: {current_pool_size})")
                 
-                if current_fkl_count >= dynamic_threshold or epoch == args.epochs - 1:
+                if (current_fkl_count >= dynamic_threshold and epoch >= 12) or epoch == args.epochs - 1:
                     negative_targets_mask = ~all_targets
                     if round_num == 1:
                         logger.info(f"\n>>> [Round 1] Executing Label-Level Early Cutting (Blacklist Mode)... <<<")
@@ -677,7 +696,7 @@ def main():
                         # 处理 FP (保持不变，但加入极值压制防坍塌)
                         fp_mask = (all_targets == 1) & (~global_label_mask)
                         # final_soft_targets[fp_mask] = torch.clamp(ema_preds[fp_mask], max=0.5) 
-                        final_soft_targets[fp_mask] = torch.clamp(ema_preds[fp_mask], max=1) 
+                        final_soft_targets[fp_mask] = torch.clamp(ema_preds[fp_mask], max=0.3) 
 
                         # ==========================================
                         # 🌟 重大升级：引入医学大模型 (LLM) 先验知识矩阵

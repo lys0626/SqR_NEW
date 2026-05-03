@@ -21,7 +21,7 @@ DATA_DIR="/data/dsj/lys/vinbigdata"
 # DATASET_NAME_UPPER="CHEXPERT"
 # DATA_DIR="/data/chexpert_224"
 
-EXP_DIR="./experiment/VINVIG/5_1_DinoV2_1_2_0.96_old_0.2_sym"        # 实验输出的顶层根目录
+EXP_DIR="./experiment/VINVIG/5_2_Resnet50_12_0.94_old_0.5_sym_resnet50"        # 实验输出的顶层根目录
 # EXP_DIR="./experiment/vision"
 # ================= 2. 方法选择配置 =================
 # 可选值: "splicemix" 或 "splicemix-cl"，或 baseline（不使用任何增强）
@@ -41,25 +41,20 @@ echo "==================================================="
   # --noise_type asym \
   # --fn_rate 0.5 \
   # --fp_rate 0.5 \
-python stage1_main_dinov2.py \
+python stage1_main_resnet50.py \
   --dataname "${DATASET_NAME}" \
   --dataset_dir "${DATA_DIR}" \
   --output "${STAGE1_OUT}" \
-  --epochs 50 \
+  --epochs 60 \
   --batch-size 128 \
   --lr 1e-4 \
   -cd ${GPU_ID} \
   --img_size 224 \
-  --num_class ${NUM_CLASS} \
-  --workers 8 \
-  --pretrained \
-  --warm_up_epochs 2 \
-  --fkl_consecutive_epochs 5 \
+  --num_class 15 \
+  --fkl_consecutive_epochs 8 \
+  --optim AdamW \
   --early_cutting_rate 5 \
-  --newremove_rate 15000 \
-  --top_conf_ratio 0.2 \
-  --low_grad_ratio 0.2 \
+  --warm_up_epochs 12 \
   --inject_noise \
   --noise_type sym \
-  --sym_rate 0.2 \
-  --optim AdamW 
+  --sym_rate 0.5
