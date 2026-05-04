@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import time, os, shutil
 from torch.cuda.amp import GradScaler, autocast
 from utilities_s2 import utils, metric, utils_ddp, warmup, logger
@@ -9,15 +10,33 @@ import copy, math
 from models_s2.SpliceMix_CL import Loss_fn
 import numpy as np
 from torch.utils.data import Dataset
-class SoftLabelDatasetWrapper(Dataset):
+def _resolve_stage1_tensor_path(explicit_path, soft_label_path, filename):
+    if explicit_path:
+        return explicit_path
+    if soft_label_path:
+        return os.path.join(os.path.dirname(soft_label_path), filename)
+    return ''
+
+def _load_stage1_tensor(path, shape, default_value, dtype):
+    if path and os.path.exists(path):
+        tensor = torch.load(path, map_location='cpu')
+        assert tensor.shape == shape, f"Stage1 tensor shape {tensor.shape} mismatch with expected {shape}: {path}"
+        return tensor.to(dtype=dtype)
+    return torch.full(shape, default_value, dtype=dtype)
+
+class ReliabilitySoftLabelDatasetWrapper(Dataset):
     """
     字典兼容的数据集包装器：
     将 Stage 1 的软标签注入 data['target'] 供网络训练，
     同时将原硬标签保留为 data['target_hard'] 供指标监控。
     """
-    def __init__(self, original_dataset, soft_targets_tensor):
+    def __init__(self, original_dataset, soft_targets_tensor, label_weight=None, label_reliability=None, fp_mask=None, fn_mask=None):
         self.dataset = original_dataset
         self.soft_targets = soft_targets_tensor.cpu() # 放在 CPU 防止主进程显存爆炸
+        self.label_weight = label_weight.cpu() if label_weight is not None else torch.ones_like(self.soft_targets)
+        self.label_reliability = label_reliability.cpu() if label_reliability is not None else torch.ones_like(self.soft_targets)
+        self.fp_mask = fp_mask.cpu().bool() if fp_mask is not None else torch.zeros_like(self.soft_targets, dtype=torch.bool)
+        self.fn_mask = fn_mask.cpu().bool() if fn_mask is not None else torch.zeros_like(self.soft_targets, dtype=torch.bool)
 
     def __len__(self):
         return len(self.dataset)
@@ -32,6 +51,11 @@ class SoftLabelDatasetWrapper(Dataset):
         
         # 3. 将软标签注入 target 键，供网络反向传播
         data['target'] = self.soft_targets[index].clone()
+        data['label_reliability'] = self.label_reliability[index].clone()
+        data['fp_mask'] = self.fp_mask[index].clone()
+        data['fn_mask'] = self.fn_mask[index].clone()
+        data['label_weight'] = self.label_weight[index].clone()
+        data['sample_index'] = index
         
         return data
 class ModelEMA:
@@ -109,7 +133,40 @@ class Engine(object):
             # 安全校验：确保软标签数量与训练集长度一致
             assert soft_targets_tensor.shape[0] == len(train_set), \
                 f"🚨 Error: Soft targets length ({soft_targets_tensor.shape[0]}) mismatch with train_set ({len(train_set)})!"
-            train_set = SoftLabelDatasetWrapper(train_set, soft_targets_tensor)
+            label_weight = None
+            label_reliability = None
+            fp_mask = None
+            fn_mask = None
+            if getattr(self.args, 'use_stage1_reliability', False):
+                shape = soft_targets_tensor.shape
+                reliability_path = _resolve_stage1_tensor_path(getattr(self.args, 'label_reliability_path', ''), soft_label_path, 'label_reliability.pt')
+                fp_path = _resolve_stage1_tensor_path(getattr(self.args, 'fp_mask_path', ''), soft_label_path, 'fp_mask.pt')
+                fn_path = _resolve_stage1_tensor_path(getattr(self.args, 'fn_mask_path', ''), soft_label_path, 'fn_mask.pt')
+                hard_clean_path = _resolve_stage1_tensor_path(getattr(self.args, 'hard_clean_mask_path', ''), soft_label_path, 'hard_clean_mask.pt')
+
+                label_reliability = _load_stage1_tensor(reliability_path, shape, 1.0, torch.float32).clamp(0.0, 1.0)
+                fp_mask = _load_stage1_tensor(fp_path, shape, False, torch.bool)
+                fn_mask = _load_stage1_tensor(fn_path, shape, False, torch.bool)
+                hard_clean_mask = _load_stage1_tensor(hard_clean_path, shape, False, torch.bool)
+
+                label_weight = label_reliability.clamp(
+                    min=getattr(self.args, 'reliability_min_weight', 0.2),
+                    max=1.0,
+                )
+                fp_cap = torch.full_like(label_weight, getattr(self.args, 'fp_loss_weight', 0.3))
+                fn_floor = torch.full_like(label_weight, getattr(self.args, 'fn_loss_weight', 0.7))
+                label_weight = torch.where(fp_mask, torch.minimum(label_weight, fp_cap), label_weight)
+                label_weight = torch.where(fn_mask, torch.maximum(label_weight, fn_floor), label_weight)
+                label_weight = torch.where(hard_clean_mask, torch.ones_like(label_weight), label_weight)
+                self.logger.info(f" >>> Loaded Stage 1 reliability weights: {reliability_path}")
+            train_set = ReliabilitySoftLabelDatasetWrapper(
+                train_set,
+                soft_targets_tensor,
+                label_weight=label_weight,
+                label_reliability=label_reliability,
+                fp_mask=fp_mask,
+                fn_mask=fn_mask,
+            )
             self.logger.info(" >>> 🎯 Successfully wrapped train_set with Stage 1 Soft Labels!")
         else:
             self.logger.warning(" !!! No soft labels found. Training with ORIGINAL HARD LABELS !!!")
@@ -152,8 +209,8 @@ class Engine(object):
             torch.cuda.empty_cache()
 
             for i, data in enumerate(train_loader):
-                inputs, targets, targets_gt, file_name = self.on_start_batch(data)
-                outputs, loss = self.on_forward(inputs, targets, file_name, is_train=True)
+                inputs, targets, targets_gt, file_name, label_weight = self.on_start_batch(data)
+                outputs, loss = self.on_forward(inputs, targets, file_name, is_train=True, label_weight=label_weight)
                 self.on_end_batch(outputs, targets_gt.data, loss.data, file_name)
 
             self.on_end_epoch(is_train=True, result=self.result['train'])
@@ -193,11 +250,11 @@ class Engine(object):
             self.logger.info(f"==> Evaluating {item['tag']} Set...")
             
             for i, data in enumerate(item['loader']):
-                inputs, targets, targets_gt, file_name = self.on_start_batch(data)
+                inputs, targets, targets_gt, file_name, label_weight = self.on_start_batch(data)
                 with torch.no_grad():
                     with autocast(enabled=not self.args.disable_amp):
                         if not item['is_ema']:
-                            outputs, loss = self.on_forward(inputs, targets, file_name, is_train=False)
+                            outputs, loss = self.on_forward(inputs, targets, file_name, is_train=False, label_weight=label_weight)
                         else:
                             outputs = m(inputs)
                             if isinstance(outputs, tuple): outputs = outputs[0]
@@ -209,7 +266,28 @@ class Engine(object):
 
             # 传入 eval_tag，用于精准控制日志和权重保存
             self.on_end_epoch(is_train=False, result=item['res'], result_best=item['best'], is_ema=item['is_ema'], eval_tag=item['tag'])
-    def on_forward(self, inputs, targets, file_name, is_train):
+    def reliability_weighted_bce(self, logits, targets, label_weight):
+        loss_mat = F.binary_cross_entropy_with_logits(logits, targets.float(), reduction='none')
+        if label_weight is None:
+            label_weight = torch.ones_like(targets)
+        label_weight = label_weight.to(loss_mat.device).float()
+        return (loss_mat * label_weight).sum() / label_weight.sum().clamp_min(1.0)
+
+    def reliability_weighted_loss(self, outputs, targets, label_weight):
+        if isinstance(outputs, tuple) and len(outputs) == 5:
+            preds_all, preds_mix, preds_m_r, targets_all, weights_all = outputs
+            loss_bce = self.reliability_weighted_bce(preds_all, targets_all, weights_all)
+            loss_cl = F.binary_cross_entropy_with_logits(preds_mix, preds_m_r.sigmoid().detach())
+            return loss_bce + loss_cl
+        if isinstance(outputs, tuple) and len(outputs) == 3:
+            preds_mix, targets_mix, weights_mix = outputs
+            return self.reliability_weighted_bce(preds_mix, targets_mix, weights_mix)
+        if isinstance(outputs, tuple) and len(outputs) == 2:
+            preds_mix, targets_mix = outputs
+            return self.reliability_weighted_bce(preds_mix, targets_mix, torch.ones_like(targets_mix))
+        return self.reliability_weighted_bce(outputs, targets, label_weight)
+
+    def on_forward(self, inputs, targets, file_name, is_train, label_weight=None):
         # ==============================================================
         # 1. 动态计算训练进度比例 progress_ratio (0.0 到 1.0 之间)
         # 如果是纯测试调用没有 epoch 属性，默认取 1.0 (最严苛把关模式)
@@ -225,12 +303,13 @@ class Engine(object):
                 if 'SpliceMix' in self.args.mixer: 
                     args = {
                         'mixer': self.mixer,
-                        'targets': targets
+                        'targets': targets,
+                        'label_weight': label_weight
                     }
                 
                 outputs = self.model(inputs, args)
                 #原有的BCE LOSS
-                loss = self.loss_fn(outputs, targets)
+                loss = self.reliability_weighted_loss(outputs, targets, label_weight)
 
                 # #下面是采用动态 ASL loss
                 # # 2. 将 progress_ratio 注入到损失函数中！
@@ -296,8 +375,10 @@ class Engine(object):
         targets_gt = data.get('target_hard', data['target']).clone().to(self.rank)
         targets_gt[targets_gt == -1] = 0
 
+        label_weight = data.get('label_weight', torch.ones_like(data['target'])).clone().to(self.rank)
+        label_weight = label_weight.float()
 
-        return inputs, targets, targets_gt, file_name
+        return inputs, targets, targets_gt, file_name, label_weight
 
     def on_end_batch(self, outputs, targets_gt, loss, image_name=''):
         bs = self.args.batch_size

@@ -31,9 +31,11 @@ class SpliceMix(object):
         if self.Default: print("SpliceMix w/ default setting")
         if self.Mini: print("SpliceMix w/ minimalism setting")
     
-    def Smix(self, inputs, targets, ):
+    def Smix(self, inputs, targets, weights=None):
         if np.random.rand(1) > self.mix_prob:
-            return inputs, targets, {}
+            if weights is None:
+                return inputs, targets, {}
+            return inputs, targets, weights, {}
         if self.Default:
             coin = random.random()
             coin_dp = random.random()
@@ -69,11 +71,19 @@ class SpliceMix(object):
             rand_ind = rand_ind[ng * g:]
             if g_row != g_col and self.use_asym:  # for asymmetric grids
                 if np.random.randn() < 0: g_row, g_col = g_col, g_row
-            inputs_mix_g, targets_mix_g, drop_ind = self.mix_fn(inputs[rand_ind_g], targets[rand_ind_g],
-                                                       g_row=g_row, g_col=g_col, n_grid=ng, n_drop=n_drop,)
+            weights_g = weights[rand_ind_g] if weights is not None else None
+            mix_result = self.mix_fn(inputs[rand_ind_g], targets[rand_ind_g],
+                                     g_row=g_row, g_col=g_col, n_grid=ng, n_drop=n_drop,
+                                     weights=weights_g)
+            if weights is None:
+                inputs_mix_g, targets_mix_g, drop_ind = mix_result
+            else:
+                inputs_mix_g, targets_mix_g, weights_mix_g, drop_ind = mix_result
 
             inputs = torch.cat([inputs, inputs_mix_g], dim=0)
             targets = torch.cat([targets, targets_mix_g], dim=0)
+            if weights is not None:
+                weights = torch.cat([weights, weights_mix_g], dim=0)
             mix_dict['rand_inds'].append(rand_ind_g)
             mix_dict['rows'].append(g_row)
             mix_dict['cols'].append(g_col)
@@ -81,9 +91,11 @@ class SpliceMix(object):
             mix_dict['drop_inds'].append(drop_ind)  # the index in a mixed image, e.g., for a 2x2 grid, len(drop_ind)=4 || rand_ind_g[bool(drop_ind)] back to the index of dropped regular images
             mix_ind = torch.cat([mix_ind, torch.ones((ng), device=mix_ind.device)], dim=0)
         flag = {'mix_ind': mix_ind, 'mix_dict': mix_dict, }
-        return inputs, targets, flag
+        if weights is None:
+            return inputs, targets, flag
+        return inputs, targets, weights, flag
 
-    def mix_fn(self, inputs, targets, g_row, g_col, n_grid, n_drop=0):
+    def mix_fn(self, inputs, targets, g_row, g_col, n_grid, n_drop=0, weights=None):
         bs, c, h, w = inputs.shape
         g = g_row * g_col
         drop_ind = torch.zeros((bs), device=inputs.device)
@@ -120,6 +132,8 @@ class SpliceMix(object):
 
         if n_drop > 0:
             targets = targets * (1 - drop_ind[:, None])
+            if weights is not None:
+                weights = weights * (1 - drop_ind[:, None])
         #软标签值大于0的视为标注为1的硬标签
         # targets_mix = targets.view(n_grid, g, -1).sum(1)  # ng, nc
         # targets_mix[targets_mix > 0] = 1
@@ -129,24 +143,27 @@ class SpliceMix(object):
         # ==========================================================
             
         # 1. 先使用 max 获取合并网格在各个类别上的最大软概率，根据阈值区分标注为0和1的硬标签
-        targets_mix_soft = targets.view(n_grid, g, -1).max(dim=1)[0] 
+        # targets_mix_soft = targets.view(n_grid, g, -1).max(dim=1)[0] 
         
         # 2. 设定阈值（如 0.05），将确定性较大的病灶强制放大为 1.0，彻底消除梯度饥饿
-        targets_mix = torch.zeros_like(targets_mix_soft)
-        targets_mix[targets_mix_soft > 0.3] = 1.0
+        # targets_mix = torch.zeros_like(targets_mix_soft)
+        # targets_mix[targets_mix_soft > 0.3] = 1.0
 
         #用软标签
-        # targets_mix = targets.view(n_grid, g, -1).max(dim=1)[0]
+        targets_mix = targets.view(n_grid, g, -1).max(dim=1)[0]
 
         
-        return inputs_mix, targets_mix, drop_ind
+        if weights is None:
+            return inputs_mix, targets_mix, drop_ind
+        weights_mix = weights.view(n_grid, g, -1).max(dim=1)[0]
+        return inputs_mix, targets_mix, weights_mix, drop_ind
 
-    def Smix_minimalism(self, X, Y):
+    def Smix_minimalism(self, X, Y, weights=None):
         g_row, g_col = 2, 2
-        B, C, H, W = X.shape
+        B, C, H, width = X.shape
         ng = B // (g_row * g_col) * (g_row * g_col)
         Omega = random.sample(range(B), B//ng)
-        X_ds = F.interpolate(X[Omega], (H // g_row, W // g_col), mode='bilinear', align_corners=True)  # g*ng, C, h', w'
+        X_ds = F.interpolate(X[Omega], (H // g_row, width // g_col), mode='bilinear', align_corners=True)  # g*ng, C, h', w'
         X_ = torchvision.utils.make_grid(X_ds, nrow=g_col, padding=0)  # C, ng*h, w
         X_ = X_.split(H, dim=1)  # tuple: ng, (C, h, w)
         X_ = torch.stack(X_, dim=0)  # ng, C, H, W
@@ -155,7 +172,11 @@ class SpliceMix(object):
 
         X_hat = torch.cat((X, X_), dim=0)
         Y_hat = torch.cat((Y, Y_), dim=0)
-        return X_hat, Y_hat, {}
+        if weights is None:
+            return X_hat, Y_hat, {}
+        W_ = weights[Omega].view(ng, g_row * g_col, -1).max(dim=1)[0]
+        W_hat = torch.cat((weights, W_), dim=0)
+        return X_hat, Y_hat, W_hat, {}
 
     def checkMode(self, mode):
         if '--' in mode:  # like Splice--Mini=True

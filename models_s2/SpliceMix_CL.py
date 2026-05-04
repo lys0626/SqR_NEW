@@ -212,10 +212,16 @@ class model(nn.Module):
         # --- 训练阶段：特征级 SpliceMix-CL ---
         mixer = args['mixer']
         targets_orig = args['targets']
+        weights_orig = args.get('label_weight', torch.ones_like(targets_orig))
         
         # 2. 在特征层进行拼接
         # 此时的 feas_all 已经包含了 [原特征, 混合特征]，targets_all 同理
-        feas_all, targets_all, flag = mixer(feas, targets_orig)
+        mix_result = mixer(feas, targets_orig, weights_orig)
+        if len(mix_result) == 4:
+            feas_all, targets_all, weights_all, flag = mix_result
+        else:
+            feas_all, targets_all, flag = mix_result
+            weights_all = torch.ones_like(targets_all)
         
         # 3. 将所有特征统一通过 Stage 2 和分类器
         feas_out = self.stage2(feas_all)
@@ -223,7 +229,7 @@ class model(nn.Module):
         
         # 如果没有触发 mix (比如 random probability 没中)
         if 'mix_dict' not in flag:
-            return (preds_all, targets_all)
+            return (preds_all, targets_all, weights_all)
             
         # 4. 解析结果，准备计算 Consistency Loss
         mix_ind = flag['mix_ind']
@@ -254,7 +260,7 @@ class model(nn.Module):
             preds_m_r = torch.cat((preds_m_r, pred_teacher_aggregated), dim=0)
 
         # 返回 Tuple：包含预测结果、对齐目标、以及合并后的真实标签 (交给 Loss_fn 解析)
-        return (preds_all, preds_mix, preds_m_r, targets_all)
+        return (preds_all, preds_mix, preds_m_r, targets_all, weights_all)
 
     def get_config_optim(self, lr, lrp):
         small_lr_layers = list(map(id, self.stage1.parameters())) + list(map(id, self.stage2.parameters()))

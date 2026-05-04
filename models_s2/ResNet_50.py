@@ -33,16 +33,22 @@ class model(nn.Module):
         # 2. 特征层拼接 (Feature-level Splicing)
         mixer = args['mixer']
         targets_orig = args['targets']
+        weights_orig = args.get('label_weight', torch.ones_like(targets_orig))
         
         # 生成拼接后的特征和新的混合标签
-        feas_mix, targets_mix, flag = mixer(feas, targets_orig)
+        mix_result = mixer(feas, targets_orig, weights_orig)
+        if len(mix_result) == 4:
+            feas_mix, targets_mix, weights_mix, flag = mix_result
+        else:
+            feas_mix, targets_mix, flag = mix_result
+            weights_mix = torch.ones_like(targets_mix)
 
         # 3. 拼接特征通过深层网络
         fea_gmp = self.glb_pooling(self.stage2(feas_mix)).flatten(1)  
         output_mix = self.cls(fea_gmp)    
 
         # 训练时返回混合预测和混合标签，交给 Loss 计算
-        return (output_mix, targets_mix)
+        return (output_mix, targets_mix, weights_mix)
 
     def get_config_optim(self, lr, lrp):
         # 适配拆分后的 stage1 和 stage2 参数

@@ -1,26 +1,27 @@
-GPU_ID=1
+GPU_ID=5
 # export CUDA_VISIBLE_DEVICES=${GPU_ID}      # 指定使用的单卡 GPU 编号
 
-# DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
-# DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
-# DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
+DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
+DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
+DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
 
 # DATASET_NAME="nih"
 # DATASET_NAME_UPPER="NIH-CHEST"
 # DATA_DIR="/data/nih-chest-xrays"
 
-DATASET_NAME="chexpert"
-DATASET_NAME_UPPER="CHEXPERT"
-DATA_DIR="/data/chexpert_224"
-EXP_DIR="/data/dsj/lys/SqR-NEW/experiment/CHEXPERT_14/CHEXPERT_allclean_newmix"        # 实验输出的顶层根目录
+# DATASET_NAME="chexpert"
+# DATASET_NAME_UPPER="CHEXPERT"
+# DATA_DIR="/data/chexpert_224"
+
+EXP_DIR="/data/dsj/lys/SqR-NEW/experiment/new_stage1_2/stage2/5.3_0.975_6"        # 实验输出的顶层根目录
 
 # ================= 2. 方法选择配置 =================
 # 可选值: "splicemix" 或 "splicemix-cl"，或 baseline
-STAGE2_METHOD="splicemix"             
+STAGE2_METHOD="splicemix-cl"             
 STAGE2_OUT="${EXP_DIR}/${DATASET_NAME}/stage2_${STAGE2_METHOD}"
 mkdir -p "${STAGE2_OUT}"
 #指定软标签的路径
-SOFT_LABEL_PATH=""
+SOFT_LABEL_PATH="/data/dsj/lys/SqR-NEW/experiment/new_stage1/5.3_0.975_6/mimic/stage1_splicemix-cl/asymmetric_soft_targets.pt"
 #指定干净样本的路径
 CLEAN_IDX_PATH=""
 # 推导模型名称参数与目录名称
@@ -52,7 +53,9 @@ python stage2_main.py \
   --warmup-epochs 5 \
   --clean_mask_path "${CLEAN_IDX_PATH}" \
   -cd ${GPU_ID} \
-  --soft_label_path "${SOFT_LABEL_PATH}"
+  --soft_label_path "${SOFT_LABEL_PATH}" \
+--use_stage1_reliability
+
 echo "==================================================="
 echo "  训练流水线全部完成！Best Model 保存在 ${STAGE2_OUT} 中。"
 echo "==================================================="

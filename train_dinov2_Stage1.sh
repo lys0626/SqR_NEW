@@ -3,30 +3,26 @@
 set -e  # <--- [强烈建议新增] 只要发生任何报错，脚本立刻停止，绝不往下瞎跑！
 
 # ================= 1. 基础全局配置 =================
-GPU_ID=3
+GPU_ID=5
 # export CUDA_VISIBLE_DEVICES=${GPU_ID}      # 指定使用的单卡 GPU 编号
 
-# DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
-# DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
-# DATA_DIR="/data/mimic_cxr/PA_NEW"      # 数据集的根目录路径
+DATASET_NAME="mimic"
+DATASET_NAME_UPPER="MIMIC"
+DATA_DIR="/data/mimic_cxr/PA/7_1_2"
 
 # DATASET_NAME="nih"
 # DATASET_NAME_UPPER="NIH-CHEST"
 # DATA_DIR="/data/nih-chest-xrays"
-DATASET_NAME="vinbigdata"                     # 对应 stage1 里的 args.dataname
-DATASET_NAME_UPPER="VINBIGDATA"               
-DATA_DIR="/data/dsj/lys/vinbigdata"
 
-# DATASET_NAME="chexpert"
-# DATASET_NAME_UPPER="CHEXPERT"
-# DATA_DIR="/data/chexpert_224"
+# DATASET_NAME="vinbigdata"                     # 对应 stage1 里的 args.dataname
+# DATASET_NAME_UPPER="VINBIGDATA"               
+# DATA_DIR="/data/dsj/lys/vinbigdata"
 
-EXP_DIR="./experiment/VINVIG/5_1_DinoV2_1_2_0.96_old_0.2_sym"        # 实验输出的顶层根目录
-# EXP_DIR="./experiment/vision"
+EXP_DIR="./experiment/new_stage1_jicheng/5.4_0.995_6"  # 建议改个名字，
+
 # ================= 2. 方法选择配置 =================
-# 可选值: "splicemix" 或 "splicemix-cl"，或 baseline（不使用任何增强）
 STAGE2_METHOD="splicemix-cl"             # 配置为 "splicemix" 或 "splicemix-cl" 或 baseline
-NUM_CLASS=15
+NUM_CLASS=13                             # 注意：VinBigData 通常是 14 种疾病 + 1 个正常类，确认你的网络定义支持 15
 
 # ================= 3. 动态生成输出目录 =================
 STAGE1_OUT="${EXP_DIR}/${DATASET_NAME}/stage1_${STAGE2_METHOD}"
@@ -34,13 +30,12 @@ STAGE1_OUT="${EXP_DIR}/${DATASET_NAME}/stage1_${STAGE2_METHOD}"
 mkdir -p "${STAGE1_OUT}"
 
 echo "==================================================="
-echo "  [STEP 1] 启动 Stage 1: Q2L 预热与 MEE(Early Cutting) 标签级清洗"
-echo "  ==> 采用算法: ICCV2023 LateStopping + NeurIPS2025 MEE"
+echo "  [STEP 1] 启动 Stage 1: DINOv2 表征学习与末期多源证据去噪"
+echo "  ==> 数据集: ${DATASET_NAME_UPPER}"
 echo "  ==> 输出目录: ${STAGE1_OUT}"
 echo "==================================================="
-  # --noise_type asym \
-  # --fn_rate 0.5 \
-  # --fp_rate 0.5 \
+
+# 执行 Python 脚本
 python stage1_main_dinov2.py \
   --dataname "${DATASET_NAME}" \
   --dataset_dir "${DATA_DIR}" \
@@ -53,13 +48,6 @@ python stage1_main_dinov2.py \
   --num_class ${NUM_CLASS} \
   --workers 8 \
   --pretrained \
-  --warm_up_epochs 2 \
-  --fkl_consecutive_epochs 5 \
-  --early_cutting_rate 5 \
-  --newremove_rate 15000 \
-  --top_conf_ratio 0.2 \
-  --low_grad_ratio 0.2 \
-  --inject_noise \
-  --noise_type sym \
-  --sym_rate 0.2 \
-  --optim AdamW 
+  --optim AdamW \
+  --warm_up_epochs 6 \
+  --fkl_consecutive_epochs 5
