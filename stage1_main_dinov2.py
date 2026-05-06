@@ -32,7 +32,7 @@ from stage1_label_reliability import (
     prototype_gmm_evidence,
     save_reliability_outputs,
     save_reliability_summary,
-    top_loss_mask,
+    suspicious_high_loss_mask,
 )
 
 # ================= 新增：DINOv2 模型包装类 =================
@@ -45,7 +45,6 @@ class DINOClassifier(nn.Module):
         local_repo_path = '/data/dsj/lys/dinov2' 
         # 2. 本地权重路径 (替换为你实际上传的 .pth 文件路径)
         local_weight_path = '/data/dsj/lys/dinov2_vits14_pretrain.pth'
-        self.backbone = torch.hub.load(local_repo_path, arch, source='local', pretrained=False)
         # ================= 核心离线加载逻辑 =================
         # source='local' 表示从本地目录读取网络架构代码
         # pretrained=False 表示只构建空骨架，绝不向外网请求权重！
@@ -56,7 +55,6 @@ class DINOClassifier(nn.Module):
         # ====================================================
         # 获取 DINO 的特征维度 (vits14 为 384)
         embed_dim = self.backbone.embed_dim
-        self.fc = nn.Linear(embed_dim, num_class)
         # 替换为多标签分类头
         self.fc = nn.Linear(embed_dim, num_class)
     def _extract_cls_and_patch_tokens(self, x):
@@ -158,10 +156,11 @@ def parser_args():
     parser.add_argument('--loss_gmm_min_pos', default=100, type=int)
     parser.add_argument('--loss_gmm_prob_thresh', default=0.5, type=float)
     parser.add_argument('--loss_ema_momentum', default=0.9, type=float)
+    parser.add_argument('--mee_easy_loss_min_std', default=0.5, type=float)
     parser.add_argument('--mee_easy_loss_top_ratio', default=0.3, type=float)
     parser.add_argument('--mee_easy_min_conf', default=0.35, type=float)
     parser.add_argument('--mee_easy_grad_ratio', default=0.2, type=float)
-    parser.add_argument('--hard_clean_ema_thresh', default=0.5, type=float)
+    parser.add_argument('--hard_clean_ema_thresh', default=0.6, type=float)
     parser.add_argument('--hard_clean_var_thresh', default=0.2, type=float)
     parser.add_argument('--proto_gmm_min_pos', default=100, type=int)
     parser.add_argument('--proto_gmm_prob_thresh', default=0.5, type=float)
@@ -208,7 +207,7 @@ def parser_args():
     parser.add_argument('--noise_type', default='asym', type=str, choices=['sym', 'asym'], help='噪声类型: sym(对称) 或 asym(非对称)')
     parser.add_argument('--sym_rate', default=0.0, type=float, help='对称噪声翻转率')
     parser.add_argument('--fn_rate', default=0.0, type=float, help='漏诊率 (1变0)')
-    parser.add_argument('--fp_rate', default=0.1, type=float, help='误诊率 (0变1)')
+    parser.add_argument('--fp_rate', default=0.0, type=float, help='误诊率 (0变1)')
     # ==================================================
     args = parser.parse_args()
     return args
@@ -366,7 +365,6 @@ def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, 
         scaler.scale(loss1).backward()
         scaler.unscale_(opt1)
         torch.nn.utils.clip_grad_norm_(net1.parameters(), max_norm=1.0) # 放宽了针对 Transformer 的极小裁剪阈值
-        scaler.step(opt1)
         scaler.step(opt1)
         ema1.step()
 
@@ -922,23 +920,23 @@ def main():
                         if args.enable_label_reliability:
                             logger.info("    -> Running label-level Loss-GMM / MEE / Prototype / KNN reliability fusion...")
                             loss_gmm_losses = torch.where(dynamic_loss_seen, dynamic_loss_meter, ema_losses)
+                            active_positive_mask = all_targets.bool() & global_label_mask.bool()
                             loss_clean_mask, loss_risk_mask = loss_gmm_split(
                                 loss_gmm_losses,
-                                all_targets,
+                                active_positive_mask,
                                 min_pos=args.loss_gmm_min_pos,
                                 prob_thresh=args.loss_gmm_prob_thresh,
                                 seed=args.seed,
                             )
-                            easy_check_candidates = top_loss_mask(
+                            easy_check_candidates = suspicious_high_loss_mask(
                                 ema_losses,
                                 loss_clean_mask,
                                 top_ratio=args.mee_easy_loss_top_ratio,
+                                min_std=args.mee_easy_loss_min_std,
                             )
                             ema_models_for_reliability = (
                                 ema1.ema_model,
-                                ema2.ema_model,
-                                ema1.ema_model,
-                                ema2.ema_model,
+                                ema2.ema_model
                             )
                             mee_easy_noisy_mask = perform_mee_easy_noisy_check(
                                 ema_models_for_reliability,
@@ -949,9 +947,15 @@ def main():
                                 device,
                                 all_targets,
                             )
-
-                            seed_clean_mask = (loss_clean_mask & (~mee_easy_noisy_mask)) | (all_targets & global_label_mask)
+                            #最终干净标签的判断,下面这两个对于干净标签的判别法则不同
+                            # seed_clean_mask = (loss_clean_mask & (~mee_easy_noisy_mask)) | (all_targets & global_label_mask)
+                            seed_clean_mask = (
+                                active_positive_mask
+                                & loss_clean_mask.bool()
+                                & (~mee_easy_noisy_mask.bool())
+                            )
                             class_features = class_features_cpu.to(device=device, dtype=torch.float32)
+                            #计算类原型区分下的干净标签和噪声标签
                             proto_clean_mask, proto_noisy_mask, proto_sim = prototype_gmm_evidence(
                                 class_features,
                                 all_targets,
@@ -1211,43 +1215,6 @@ def main():
                         
                         sys.stdout.flush() 
                         sys.exit(0)
-                    # 只处理噪声样本和干净样本的划分，不修改标签
-                    # if round_num == num_rounds:
-                    #     logger.info(f"\n>>> Final Round {round_num} Reached. Executing Sample-Level Voting & Exiting! <<<")
-                        
-                    #     total_positives = all_targets.sum(dim=1) 
-                    #     clean_pos_counts = (global_label_mask & all_targets).sum(dim=1)
-                    #     noisy_pos_counts = (~global_label_mask & all_targets).sum(dim=1)
-                        
-                    #     is_clean_sample = torch.zeros(num_train_samples, dtype=torch.bool).to(device)
-                        
-                    #     has_pos = total_positives > 0
-                    #     is_clean_sample[has_pos] = clean_pos_counts[has_pos] > noisy_pos_counts[has_pos]
-                        
-                    #     no_pos = total_positives == 0
-                    #     is_clean_sample[no_pos] = True
-                        
-                    #     clean_indices = torch.nonzero(is_clean_sample).squeeze(1).tolist()
-                    #     noisy_indices = torch.nonzero(~is_clean_sample).squeeze(1).tolist()
-                        
-                    #     noise_clean_labels_dict = {}
-                    #     for n_idx in noisy_indices:
-                    #         clean_lbls = torch.nonzero(global_label_mask[n_idx]).squeeze(1).tolist()
-                    #         noise_clean_labels_dict[int(n_idx)] = clean_lbls
-
-                    #     torch.save(clean_indices, os.path.join(args.output, 'clean_indices.pt'))
-                    #     torch.save(noisy_indices, os.path.join(args.output, 'noisy_indices.pt'))
-                    #     torch.save(noise_clean_labels_dict, os.path.join(args.output, 'noise_clean_labels_dict.pt'))
-                        
-                    #     logger.info("="*60)
-                    #     logger.info(f" >>> Stage 1 Split Complete! ")
-                    #     logger.info(f"     * Clean Samples: {len(clean_indices)}")
-                    #     logger.info(f"     * Noisy Samples: {len(noisy_indices)}")
-                    #     logger.info(" >>> Exiting Stage 1 gracefully to start Stage 2  . <<<")
-                    #     logger.info("="*60)
-                        
-                    #     sys.stdout.flush() 
-                    #     sys.exit(0)
                     else:
                         logger.info(f">>> Round {round_num} Completed. Breaking inner loop to start Round {round_num + 1}. <<<")
                         break  

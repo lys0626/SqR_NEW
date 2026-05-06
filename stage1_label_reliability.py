@@ -61,23 +61,37 @@ def loss_gmm_split(losses, targets, min_pos=100, prob_thresh=0.5, seed=95):
     return loss_clean, loss_risk
 
 
-def top_loss_mask(losses, candidate_mask, top_ratio=0.3):
+# def top_loss_mask(losses, candidate_mask, top_ratio=0.3):
+#     selected = _empty_bool_like(candidate_mask)
+#     if top_ratio <= 0:
+#         return selected
+
+#     for c in range(candidate_mask.size(1)):
+#         idx = torch.where(candidate_mask[:, c])[0]
+#         if len(idx) == 0:
+#             continue
+#         k = max(1, int(math.ceil(len(idx) * top_ratio)))
+#         values = losses[idx, c]
+#         top_local = torch.topk(values, k=min(k, len(idx)), largest=True).indices
+#         selected[idx[top_local], c] = True
+
+#     return selected
+def suspicious_high_loss_mask(losses, candidate_mask, top_ratio=0.3, min_std=0.5):
     selected = _empty_bool_like(candidate_mask)
     if top_ratio <= 0:
         return selected
-
     for c in range(candidate_mask.size(1)):
         idx = torch.where(candidate_mask[:, c])[0]
         if len(idx) == 0:
             continue
-        k = max(1, int(math.ceil(len(idx) * top_ratio)))
-        values = losses[idx, c]
-        top_local = torch.topk(values, k=min(k, len(idx)), largest=True).indices
-        selected[idx[top_local], c] = True
-
+        values = losses[idx, c].float()
+        top_ratio_cut = torch.quantile(values, max(0.0, min(1.0, 1.0 - top_ratio)))
+        deviation_cut = values.mean() + max(0.0, min_std) * values.std(unbiased=False)
+        threshold = torch.maximum(top_ratio_cut, deviation_cut)
+        selected[idx[values >= threshold], c] = True
     return selected
-
-
+def top_loss_mask(losses, candidate_mask, top_ratio=0.3, min_std=0.5):
+    return suspicious_high_loss_mask(losses, candidate_mask, top_ratio=top_ratio, min_std=min_std)
 def prototype_gmm_evidence(class_features, targets, seed_clean_mask, min_pos=100, prob_thresh=0.5, seed=95):
     """Build per-class prototypes from seed-clean positives and GMM split positive-label distances."""
     device = class_features.device
@@ -188,8 +202,11 @@ def knn_purity_evidence(
 
 def build_dynamic_hard_clean_mask(loss_risk_mask, fkl_mask, ema_preds, ema_vars, proto_clean, knn_clean, ema_thresh=0.5, var_thresh=0.2):
     dynamic_support = fkl_mask.bool() & (ema_preds >= ema_thresh) & (ema_vars <= var_thresh)
-    geometry_support = proto_clean.bool() & knn_clean.bool()
-    return loss_risk_mask.bool() & (dynamic_support | geometry_support)
+    # geometry_support = proto_clean.bool() & knn_clean.bool()
+    # return loss_risk_mask.bool() & (dynamic_support | geometry_support)
+    # 折中：必须有高置信低方差 EMA，同时 geometry 至少不反对
+    return loss_risk_mask & dynamic_support & (proto_clean | knn_clean)
+
 
 
 def build_label_reliability(
@@ -207,6 +224,7 @@ def build_label_reliability(
 ):
     targets = targets.bool()
     positive = targets
+    active_positive = positive & global_label_mask.bool()
     clean_score = (
         0.6 * loss_clean_mask.float()
         + 0.8 * global_label_mask.float()
@@ -228,15 +246,21 @@ def build_label_reliability(
         torch.ones_like(clean_score),
     )
 
-    hard_clean_mask = positive & (
+    # hard_clean labels are protected from softening only inside the current
+    # retained positive pool. High-loss labels still need EMA or geometry support
+    # to be recovered as difficult clean labels.
+
+    #困难干净标签
+    hard_clean_mask = active_positive & (
         dynamic_hard_clean_mask.bool()
         | (loss_clean_mask.bool() & (~mee_easy_noisy_mask.bool()))
-        | (proto_clean_mask.bool() & knn_clean_mask.bool())
     )
+    #疑似假阳性
     clear_noisy_fp = positive & (
         mee_easy_noisy_mask.bool()
         | ((loss_risk_mask.bool() | (~global_label_mask.bool())) & proto_noisy_mask.bool() & knn_noisy_mask.bool())
     ) & (~hard_clean_mask)
+    #确认假阳性
     fp_mask = positive & (~hard_clean_mask) & (
         clear_noisy_fp
         | (~global_label_mask.bool())
@@ -269,8 +293,10 @@ def mine_false_negative_mask(
             & (ema_preds[:, c] >= ema_thresh)
             & (ema_vars[:, c] <= var_thresh)
         )
+        #表示和干净样本类原型的相似度
         if proto_sim is not None:
             candidate = candidate & (proto_sim[:, c] >= proto_sim_thresh)
+        #表示每个样本在类别为c的空间中，它的近邻有多少比例是可靠类别
         if knn_purity is not None:
             candidate = candidate & (knn_purity[:, c] >= knn_purity_thresh)
         if not candidate.any():

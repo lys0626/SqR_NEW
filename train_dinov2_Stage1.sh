@@ -18,7 +18,7 @@ DATA_DIR="/data/mimic_cxr/PA/7_1_2"
 # DATASET_NAME_UPPER="VINBIGDATA"               
 # DATA_DIR="/data/dsj/lys/vinbigdata"
 
-EXP_DIR="./experiment/new_stage1_jicheng/5.4_0.995_6"  # 建议改个名字，
+EXP_DIR="./experiment/new_stage1/5.6_0.995_6_lr_sch_1_2_&"  # 建议改个名字，
 
 # ================= 2. 方法选择配置 =================
 STAGE2_METHOD="splicemix-cl"             # 配置为 "splicemix" 或 "splicemix-cl" 或 baseline
