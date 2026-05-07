@@ -8,6 +8,7 @@ from utilities.mimic import mimic
 from utilities.nih import nihchest
 from utilities.chexpert import chexpert
 from utilities.vinbigdata import VinBigDataDataset
+from utilities.padchest import padchest
 def get_datasets(args):
     #对输入数据标准化的两种方式。如果开启它，模型输入的是[0,1]范围内的数据。如果关闭它模型输入的就是经过imageNet统计数据标准化后的数据
     if args.orid_norm:
@@ -104,6 +105,14 @@ def get_datasets(args):
         else:
             # 如果是训练模式，加载正常的验证集
             val_dataset = VinBigDataDataset(root=args.dataset_dir, mode='valid', transform=test_data_transform)
+        args.num_class = train_dataset.get_number_classes()
+    elif args.dataname == 'padchest':
+        train_dataset = padchest(root=args.dataset_dir, mode='train', transform=train_data_transform)
+        if args.evaluate:
+            print("!!! [Evaluation Mode] Loading TEST dataset (PadChest-LT test.csv) !!!")
+            val_dataset = padchest(root=args.dataset_dir, mode='test', transform=test_data_transform)
+        else:
+            val_dataset = padchest(root=args.dataset_dir, mode='valid', transform=test_data_transform)
         args.num_class = train_dataset.get_number_classes()
     else:
         raise NotImplementedError("Unknown dataname %s" % args.dataname)

@@ -14,6 +14,7 @@ from utilities_s2.nih import nihchest
 from utilities_s2.mimic import mimic 
 from torch.utils.data import Subset
 from utilities_s2.chexpert import chexpert 
+from utilities_s2.padchest import padchest
 opj = os.path.join
 
 def init(args):
@@ -107,7 +108,7 @@ def get_dataloader(train_set=None, val_set=None, test_set=None, args=None):
 
 def get_dataset(args):
     # --- MODIFIED: data_dict 现在包含所有新数据集
-    data_dict = {'MS-COCO': COCO2014, 'VOC2007': VOC2007,'NIH-CHEST':nihchest, 'MIMIC':mimic, 'CHEXPERT':chexpert}
+    data_dict = {'MS-COCO': COCO2014, 'VOC2007': VOC2007,'NIH-CHEST':nihchest, 'MIMIC':mimic, 'CHEXPERT':chexpert,'PADCHEST':padchest, 'PADCHEST-LT':padchest}
     train_transfm = get_transform(args, is_train=True)
     test_transfm = get_transform(args, is_train=False)
     # ================= 核心修复 =================
@@ -161,6 +162,16 @@ def get_dataset(args):
             test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm)
         else:
             # 纯测试模式：只加载 Train (占位) 和 Test
+            print(f"!!! [Evaluation Mode] Loading TEST dataset for {args.data_set} !!!")
+            train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
+            test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm)
+    elif args.data_set in ('PADCHEST', 'PADCHEST-LT'):
+        data_dir = args.data_root
+        if args.is_train:
+            train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
+            val_set = data_dict[args.data_set](data_dir, mode='valid', transform=test_transfm)
+            test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm)
+        else:
             print(f"!!! [Evaluation Mode] Loading TEST dataset for {args.data_set} !!!")
             train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
             test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm)

@@ -10,10 +10,11 @@ def check_tensor(tensor):
     return tensor
 
 class AveragePrecisionMeter(object):
-    def __init__(self, difficult_examples=True):
+    def __init__(self, difficult_examples=True, eval_indices=None):
         super(AveragePrecisionMeter, self).__init__()
         self.reset()
         self.difficult_examples = difficult_examples
+        self.eval_indices = list(eval_indices) if eval_indices is not None else None
 
     def reset(self):
         self.scores = torch.FloatTensor(torch.FloatStorage())
@@ -57,6 +58,9 @@ class AveragePrecisionMeter(object):
 
         y_scores = self.scores.numpy()
         y_true = self.targets.numpy()
+        if self.eval_indices:
+            y_scores = y_scores[:, self.eval_indices]
+            y_true = y_true[:, self.eval_indices]
         y_true[y_true == -1] = 0  # 确保没有 -1 标签
 
         # 1. 计算 mAUC (及 per-class AUC)

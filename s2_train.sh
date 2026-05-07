@@ -1,19 +1,22 @@
-GPU_ID=5
+GPU_ID=4
 # export CUDA_VISIBLE_DEVICES=${GPU_ID}      # 指定使用的单卡 GPU 编号
 
 # DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
 # DATASET_NAME_UPPER="MIMIC"               # 数据集名称大写 (给 Stage2 用: MIMIC, NIH-CHEST)
 # DATA_DIR="/data/mimic_cxr/PA/7_1_2"      # 数据集的根目录路径
 
-DATASET_NAME="nih"
-DATASET_NAME_UPPER="NIH-CHEST"
-DATA_DIR="/data/nih-chest-xrays"
+# DATASET_NAME="nih"
+# DATASET_NAME_UPPER="NIH-CHEST"
+# DATA_DIR="/data/nih-chest-xrays"
 
 # DATASET_NAME="chexpert"
 # DATASET_NAME_UPPER="CHEXPERT"
 # DATA_DIR="/data/chexpert_224"
 
-EXP_DIR="/data/dsj/lys/SqR-NEW/experiment/new_stage1_stage2/5.3_0.995_9"        # 实验输出的顶层根目录
+DATASET_NAME="padchest"              # 对应 stage1 里的 --dataname
+DATASET_NAME_UPPER="PADCHEST-LT"
+DATA_DIR="/data/padchest"
+EXP_DIR="/data/dsj/lys/SqR-NEW/experiment/PADCHEST/"        # 实验输出的顶层根目录
 
 # ================= 2. 方法选择配置 =================
 # 可选值: "splicemix" 或 "splicemix-cl"，或 baseline
@@ -36,7 +39,7 @@ else
     MIXER_ARG=""
     MODEL_DIR="ResNet_50"
 fi
-
+# --use_stage1_reliability
 # 注意：这里的 -mixer 加上了双引号，防止参数为空时发生偏移报错
 python stage2_main.py \
   --data-set "${DATASET_NAME_UPPER}" \
@@ -45,13 +48,13 @@ python stage2_main.py \
   --model "${MODEL_ARG}" \
   -mixer "${MIXER_ARG}" \
   --epochs 100 \
-  --batch-size 32 \
+  --batch-size 128 \
   --optimizer SGD \
   --lr 0.05 \
   --warmup-epochs 5 \
   -cd ${GPU_ID} \
   --soft_label_path "${SOFT_LABEL_PATH}" \
-  --use_stage1_reliability
+ 
 
 echo "==================================================="
 echo "  训练流水线全部完成！Best Model 保存在 ${STAGE2_OUT} 中。"

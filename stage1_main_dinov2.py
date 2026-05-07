@@ -120,7 +120,7 @@ def sec_to_str(seconds):
 def parser_args():
     parser = argparse.ArgumentParser(description='DINOv2 NIH Training (Stage 1 - MEE Label-Level)')
     # == 原有基础参数 ==
-    parser.add_argument('--dataname', default='nih', choices=['coco14', 'mimic', 'nih','chexpert', 'vinbigdata'])
+    parser.add_argument('--dataname', default='nih', choices=['coco14', 'mimic', 'nih','chexpert', 'vinbigdata', 'padchest'])
     parser.add_argument('--dataset_dir', default='/comp_robot')
     parser.add_argument('--img_size', default=224, type=int) # 注意：必须是 14 的倍数
     parser.add_argument('--output', metavar='DIR', help='path to output folder')
@@ -387,7 +387,7 @@ def update_fkl_mask(models, loader, device, fkl_consecutive_counts, fkl_mask, co
         indices = indices.to(device, non_blocking=True)
         
         logits = ensemble_logits(models, x)
-        preds = (torch.sigmoid(logits) > 0.5).float()
+        preds = (torch.sigmoid(logits) > 0.6).float()
         
         is_correct_and_positive = (preds == y) & (y == 1)
         
@@ -681,7 +681,7 @@ def validate_with_meter(models, val_loader, device,args):
     for m in models: 
         m.eval()
         
-    meter = AveragePrecisionMeter()
+    meter = AveragePrecisionMeter(eval_indices=getattr(val_loader.dataset, 'eval_indices', None))
     
     for images, targets, _ in val_loader:
         images = images.to(device, non_blocking=True)
@@ -819,28 +819,6 @@ def main():
             
             val_metrics = validate_with_meter(models, val_loader, device,args)
             
-            # val_auroc = val_metrics.get('mAUC', 0.0)
-            # val_macro_f1 = val_metrics.get('macro_F1', 0.0)
-            
-            # logger.info(f"    -> Epoch {epoch + 1} Val mAUC: {val_auroc:.4f} | Macro F1: {val_macro_f1:.4f}")
-            
-            # if val_auroc > best_global_auroc:
-            #     best_global_auroc = val_auroc
-            #     best_ckpt_path = os.path.join(args.output, 'best_stage1_model.pth')
-                
-            #     logger.info(f"    >>> [Best Model] Saving new best model (mAUC: {best_global_auroc:.4f}) to {best_ckpt_path} <<<")
-            #     torch.save({
-            #         'round': round_num,
-            #         'epoch': epoch,
-            #         'net1': net1.state_dict(),
-            #         'net2': net2.state_dict(),
-            #         'net1_ema': ema1.ema_model.state_dict(),
-            #         'net2_ema': ema2.ema_model.state_dict(),
-            #         'best_auroc': best_global_auroc
-            #     }, best_ckpt_path)
-            # ========================================================
-            # 🌟 新增：动态获取目标分数并打印双规日志
-            # ========================================================
             
             current_val_score = val_metrics.get('mAUC', 0.0)
             target_name = "mAUC"

@@ -449,8 +449,9 @@ class Engine(object):
                 auc_list = metrics_res['auc_list']
                 # 尝试从 dataset 中获取疾病名称，增加 EMA 模式下的容错
                 target_ds = self.dataset['test']
-                class_names = getattr(target_ds, 'classes', [f"Class_{i}" for i in range(len(auc_list))])
-                
+                class_names = getattr(target_ds, 'eval_classes', None)
+                if not class_names or len(class_names) != len(auc_list):
+                    class_names = getattr(target_ds, 'classes', [f"Class_{i}" for i in range(len(auc_list))])
                 per_class_str = ", ".join([
                     f"{name}: {auc:.4f}" if auc != -1.0 else f"{name}: N/A" 
                     for name, auc in zip(class_names, auc_list)
@@ -595,7 +596,11 @@ class Engine(object):
     def reset_meters(self):
         self.meter['loss'] = metric.AverageMeter('loss')
         self.meter['loss_all'] = metric.AverageMeter('loss all rank')
-        self.meter['ap'] = metric.AveragePrecisionMeter(difficult_examples=False)
+        eval_indices = None
+        if hasattr(self, 'dataset'):
+            target_ds = self.dataset.get('val') or self.dataset.get('test')
+            eval_indices = getattr(target_ds, 'eval_indices', None) if target_ds is not None else None
+        self.meter['ap'] = metric.AveragePrecisionMeter(difficult_examples=False, eval_indices=eval_indices)
 
     @staticmethod
     def convertDict_state(cpk):
