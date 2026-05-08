@@ -12,8 +12,7 @@ import torch.nn.functional as F
 from torch.optim import lr_scheduler
 import torch.backends.cudnn as cudnn
 import torch.utils.data
-import torchvision
-import torch.nn as nn
+
 from torch.utils.tensorboard import SummaryWriter
 import csv
 from lib.dataset.get_dataset import get_datasets
@@ -23,11 +22,25 @@ from lib.utils.misc import clean_state_dict
 from lib.utils.slconfig import get_raw_dict
 from collections import defaultdict
 from lib.models.aslloss import AsymmetricLossOptimized
+from stage1_label_reliability import (
+    build_dynamic_hard_clean_mask,
+    build_label_reliability,
+    generate_asymmetric_soft_targets,
+    knn_purity_evidence,
+    loss_gmm_split,
+    mine_false_negative_mask,
+    prototype_gmm_evidence,
+    save_reliability_outputs,
+    save_reliability_summary,
+    suspicious_high_loss_mask,
+)
 
 # ================= 新增：DINOv2 模型包装类 =================
 class DINOClassifier(nn.Module):
-    def __init__(self, num_class, arch='dinov2_vits14'):
+    def __init__(self, num_class, arch='dinov2_vits14', cam_temperature=0.2):
         super().__init__()
+        self.num_class = num_class
+        self.cam_temperature = cam_temperature
         # 1. 本地代码路径 (替换为你实际上传的 dinov2 仓库目录)
         local_repo_path = '/data/dsj/lys/dinov2' 
         # 2. 本地权重路径 (替换为你实际上传的 .pth 文件路径)
@@ -44,11 +57,57 @@ class DINOClassifier(nn.Module):
         embed_dim = self.backbone.embed_dim
         # 替换为多标签分类头
         self.fc = nn.Linear(embed_dim, num_class)
-    def forward(self, x):
-        features = self.backbone(x)
-        logits = self.fc(features)
-        return logits
+    def _extract_cls_and_patch_tokens(self, x):
+        cls_token, patch_tokens = None, None
+        if hasattr(self.backbone, 'forward_features'):
+            features = self.backbone.forward_features(x)
+            if isinstance(features, dict):
+                cls_token = features.get('x_norm_clstoken', None)
+                patch_tokens = features.get('x_norm_patchtokens', None)
+                if cls_token is None and 'x_prenorm' in features:
+                    tokens = features['x_prenorm']
+                    cls_token = tokens[:, 0]
+                    patch_tokens = tokens[:, 1:]
+                if patch_tokens is None:
+                    patch_tokens = features.get('x_patchtokens', None)
+            elif torch.is_tensor(features):
+                cls_token = features
+
+        if cls_token is None:
+            cls_token = self.backbone(x)
+        if cls_token.dim() == 3:
+            if patch_tokens is None and cls_token.size(1) > 1:
+                patch_tokens = cls_token[:, 1:]
+            cls_token = cls_token[:, 0]
+        return cls_token, patch_tokens
+
+    def _class_weighted_patch_pool(self, patch_tokens):
+        if patch_tokens is None:
+            return None
+        patch_norm = F.normalize(patch_tokens, p=2, dim=-1)
+        weight_norm = F.normalize(self.fc.weight, p=2, dim=-1)
+        cam_logits = torch.einsum('bpd,cd->bcp', patch_norm, weight_norm)
+        attn = torch.softmax(cam_logits / max(self.cam_temperature, 1e-6), dim=-1)
+        class_features = torch.einsum('bcp,bpd->bcd', attn, patch_norm)
+        return F.normalize(class_features, p=2, dim=-1)
+
+    def forward(self, x, return_class_features=False):
+        cls_token, patch_tokens = self._extract_cls_and_patch_tokens(x)
+        logits = self.fc(cls_token)
+        if not return_class_features:
+            return logits
+
+        class_features = self._class_weighted_patch_pool(patch_tokens)
+        if class_features is None:
+            class_features = cls_token.unsqueeze(1).expand(-1, self.num_class, -1)
+            class_features = F.normalize(class_features, p=2, dim=-1)
+        return logits, class_features
 def build_dino(args):
+    return DINOClassifier(
+        num_class=args.num_class,
+        arch='dinov2_vits14',
+        cam_temperature=args.cam_temperature,
+    )
     # 使用 vits14 版本，对显存较友好
     return DINOClassifier(num_class=args.num_class, arch='dinov2_vits14')
 # ==========================================================
@@ -61,7 +120,7 @@ def sec_to_str(seconds):
 def parser_args():
     parser = argparse.ArgumentParser(description='DINOv2 NIH Training (Stage 1 - MEE Label-Level)')
     # == 原有基础参数 ==
-    parser.add_argument('--dataname', default='nih', choices=['coco14', 'mimic', 'nih','chexpert', 'vinbigdata'])
+    parser.add_argument('--dataname', default='nih', choices=['coco14', 'mimic', 'nih','chexpert', 'vinbigdata', 'padchest'])
     parser.add_argument('--dataset_dir', default='/comp_robot')
     parser.add_argument('--img_size', default=224, type=int) # 注意：必须是 14 的倍数
     parser.add_argument('--output', metavar='DIR', help='path to output folder')
@@ -91,8 +150,36 @@ def parser_args():
     parser.add_argument('--amp', action='store_true', default=False)
     parser.add_argument('--seed', default=95, type=int)
 
+    parser.add_argument('--enable_label_reliability', action='store_true', default=True)
+    parser.add_argument('--disable_label_reliability', dest='enable_label_reliability', action='store_false')
+    parser.add_argument('--cam_temperature', default=0.2, type=float)
+    parser.add_argument('--loss_gmm_min_pos', default=100, type=int)
+    parser.add_argument('--loss_gmm_prob_thresh', default=0.5, type=float)
+    parser.add_argument('--loss_ema_momentum', default=0.9, type=float)
+    parser.add_argument('--mee_easy_loss_min_std', default=0.5, type=float)
+    parser.add_argument('--mee_easy_loss_top_ratio', default=0.3, type=float)
+    parser.add_argument('--mee_easy_min_conf', default=0.35, type=float)
+    parser.add_argument('--mee_easy_grad_ratio', default=0.2, type=float)
+    parser.add_argument('--hard_clean_ema_thresh', default=0.6, type=float)
+    parser.add_argument('--hard_clean_var_thresh', default=0.2, type=float)
+    parser.add_argument('--proto_gmm_min_pos', default=100, type=int)
+    parser.add_argument('--proto_gmm_prob_thresh', default=0.5, type=float)
+    parser.add_argument('--knn_k', default=50, type=int)
+    parser.add_argument('--knn_chunk_size', default=512, type=int)
+    parser.add_argument('--knn_tail_cutoff', default=100, type=int)
+    parser.add_argument('--knn_mid_cutoff', default=200, type=int)
+    parser.add_argument('--knn_tail_purity', default=0.0, type=float)
+    parser.add_argument('--knn_mid_purity', default=0.05, type=float)
+    parser.add_argument('--knn_head_purity', default=0.1, type=float)
+    parser.add_argument('--fp_soft_max', default=0.5, type=float)
+    parser.add_argument('--fn_ema_thresh', default=0.7, type=float)
+    parser.add_argument('--fn_var_thresh', default=0.2, type=float)
+    parser.add_argument('--fn_proto_sim_thresh', default=0.35, type=float)
+    parser.add_argument('--fn_knn_purity_thresh', default=0.05, type=float)
+    parser.add_argument('--fn_prior_thresh', default=0.2, type=float)
+
     # ================= 标签级 MEE 核心对齐参数 =================
-    parser.add_argument('--warm_up_epochs', default=0, type=int, help='前几个 Epoch 不记录 FkL')
+    parser.add_argument('--warm_up_epochs', default=6, type=int, help='前几个 Epoch 不记录 FkL')
     parser.add_argument('--fkl_consecutive_epochs', default=5, type=int, help='需要连续多少次预测正确才算候选干净标签')
     
     parser.add_argument('--early_cutting_rate', default=1.5, type=float)
@@ -105,22 +192,22 @@ def parser_args():
     parser.add_argument('--orid_norm', action='store_true', default=False)
 
     # Phase 控制参数
-    parser.add_argument("--i_rate_1", type=int, default=3)
-    parser.add_argument("--i_rate_2", type=int, default=3)
-    parser.add_argument("--i_rate_3", type=int, default=3)
-    parser.add_argument("--i_rate_4", type=int, default=3)
+    parser.add_argument("--i_rate_1", type=int, default=2)
+    parser.add_argument("--i_rate_2", type=int, default=2)
+    parser.add_argument("--i_rate_3", type=int, default=0)
+    parser.add_argument("--i_rate_4", type=int, default=0)
     
-    parser.add_argument("--remove_rate_1", type=float, default=0.94)
-    parser.add_argument("--remove_rate_2", type=float, default=0.94)
-    parser.add_argument("--remove_rate_3", type=float, default=0.94)
-    parser.add_argument("--remove_rate_4", type=float, default=0.94)
+    parser.add_argument("--remove_rate_1", type=float, default=0.95)
+    parser.add_argument("--remove_rate_2", type=float, default=0.95)
+    parser.add_argument("--remove_rate_3", type=float, default=0.995)
+    parser.add_argument("--remove_rate_4", type=float, default=0.995)
 
    # ================= 替换这里的代码 =================
     parser.add_argument('--inject_noise', action='store_true', help='是否注入噪声')
     parser.add_argument('--noise_type', default='asym', type=str, choices=['sym', 'asym'], help='噪声类型: sym(对称) 或 asym(非对称)')
-    parser.add_argument('--sym_rate', default=0.2, type=float, help='对称噪声翻转率')
-    parser.add_argument('--fn_rate', default=0.4, type=float, help='漏诊率 (1变0)')
-    parser.add_argument('--fp_rate', default=0.1, type=float, help='误诊率 (0变1)')
+    parser.add_argument('--sym_rate', default=0.0, type=float, help='对称噪声翻转率')
+    parser.add_argument('--fn_rate', default=0.0, type=float, help='漏诊率 (1变0)')
+    parser.add_argument('--fp_rate', default=0.0, type=float, help='误诊率 (0变1)')
     # ==================================================
     args = parser.parse_args()
     return args
@@ -164,20 +251,39 @@ def build_dual_optimizers(net1, net2, args):
         opt2 = torch.optim.SGD(get_params(net2), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
     return opt1, opt2
 
+def _as_logits(output):
+    return output[0] if isinstance(output, tuple) else output
+
+def _forward_logits(model, x):
+    return _as_logits(model(x))
+
+def _forward_logits_and_features(model, x):
+    output = model(x, return_class_features=True)
+    if isinstance(output, tuple):
+        return output
+    logits = output
+    fallback = logits.new_zeros(logits.size(0), logits.size(1), model.fc.in_features)
+    return logits, fallback
+
 def ensemble_logits(models, x):
     net1, net2, net1e, net2e = models
     # ======= 修改：去除了解包操作 =======
-    out1 = net1(x)
-    out2 = net2(x)
-    out1e = net1e(x)
-    out2e = net2e(x)
+    out1 = _forward_logits(net1, x)
+    out2 = _forward_logits(net2, x)
+    out1e = _forward_logits(net1e, x)
+    out2e = _forward_logits(net2e, x)
     return (out1 + out2 + out1e + out2e) / 4.0
+def average_logits(models, x):
+    logits = [_forward_logits(model, x) for model in models]
+    return torch.stack(logits, dim=0).mean(dim=0)
 import torchvision.transforms as T
 
 # 在 stage1_main_dinov2.py 文件顶部引入 RandomErasing
 # RandomErasing 是一种极佳的非对称扰动，能强迫模型关注不同的局部病灶区域
 random_erasing = T.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3), value=0)
-def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, loader, criterion, args, device, global_label_mask,sch1,sch2,current_epoch):
+random_erasing = T.RandomErasing(p=0.5, scale=(0.02, 0.1), ratio=(0.3, 3.3), value=0)
+
+def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, loader, criterion, args, device, global_label_mask,sch1,sch2,current_epoch, per_label_loss_meter=None, per_label_loss_seen=None):
     net1.train()
     net2.train()
     net1e.eval()
@@ -205,12 +311,12 @@ def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, 
         images_net2 = random_erasing(images.clone())
         with torch.cuda.amp.autocast(enabled=args.amp):
             # ======= 修改：直接接收 logits =======
-            z1 = net1(images_net1)
-            z2 = net2(images_net2)
+            z1 = _forward_logits(net1, images_net1)
+            z2 = _forward_logits(net2, images_net2)
             
             with torch.no_grad():
-                z1e = net1e(images)
-                z2e = net2e(images)
+                z1e = _forward_logits(net1e, images)
+                z2e = _forward_logits(net2e, images)
 
             soft1 = torch.sigmoid(z1.detach() / temperature)
             soft2 = torch.sigmoid(z2.detach() / temperature)
@@ -236,6 +342,22 @@ def train_one_epoch_mutual_kd(net1, net2, net1e, net2e, ema1, ema2, opt1, opt2, 
             hard2 = criterion(masked_z2, targets.float(), progress_ratio)
             soft1_loss = F.binary_cross_entropy_with_logits(z1 / temperature, soft2_comb, reduction='none') * (temperature ** 2)
             soft2_loss = F.binary_cross_entropy_with_logits(z2 / temperature, soft1_comb, reduction='none') * (temperature ** 2)
+
+            if per_label_loss_meter is not None and per_label_loss_seen is not None:
+                with torch.no_grad():
+                    bce1 = F.binary_cross_entropy_with_logits(z1.detach().float(), targets.float(), reduction='none')
+                    bce2 = F.binary_cross_entropy_with_logits(z2.detach().float(), targets.float(), reduction='none')
+                    batch_losses = (bce1 + bce2) / 2.0
+                    old_losses = per_label_loss_meter[indices]
+                    old_seen = per_label_loss_seen[indices]
+                    momentum = args.loss_ema_momentum
+                    updated_losses = torch.where(
+                        old_seen,
+                        old_losses * momentum + batch_losses * (1.0 - momentum),
+                        batch_losses,
+                    )
+                    per_label_loss_meter[indices] = updated_losses
+                    per_label_loss_seen[indices] = True
 
             # loss1 = hard1 + alpha * (soft1_loss * batch_mask).sum() / max(1.0, batch_mask.sum().item())
             # loss2 = hard2 + alpha * (soft2_loss * batch_mask).sum() / max(1.0, batch_mask.sum().item())
@@ -268,7 +390,7 @@ def update_fkl_mask(models, loader, device, fkl_consecutive_counts, fkl_mask, co
         indices = indices.to(device, non_blocking=True)
         
         logits = ensemble_logits(models, x)
-        preds = (torch.sigmoid(logits) > 0.5).float()
+        preds = (torch.sigmoid(logits) > 0.6).float()
         
         is_correct_and_positive = (preds == y) & (y == 1)
         
@@ -341,7 +463,8 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
         indices = indices.numpy()
         
         images.requires_grad_(True)
-        logits = ensemble_logits(models, images)
+        # logits = ensemble_logits(models, images)
+        logits = average_logits(models, images)
         probs = torch.sigmoid(logits)
         
         for b in range(len(indices)):
@@ -389,6 +512,156 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
             
     return fkl_mask, mee_noisy_mask
 
+def perform_mee_easy_noisy_check(models, dataset, candidate_mask, args, logger, device, all_targets):
+    for model in models:
+        model.eval()
+
+    candidate_mask = candidate_mask.bool() & all_targets.bool()
+    cand_global_indices = torch.nonzero(candidate_mask)
+    num_candidates = cand_global_indices.size(0)
+    mee_easy_noisy_mask = torch.zeros_like(candidate_mask)
+    if num_candidates == 0:
+        logger.info("    -> MEE easy-noisy check skipped: no high-loss clean-pool candidates.")
+        return mee_easy_noisy_mask
+
+    logger.info(f"    -> MEE easy-noisy check on {num_candidates} high-loss clean-pool labels.")
+    sample_to_cand_classes = defaultdict(list)
+    for i, (s_idx, c_idx) in enumerate(cand_global_indices.detach().cpu().tolist()):
+        sample_to_cand_classes[int(s_idx)].append((int(c_idx), i))
+
+    unique_sample_indices = list(sample_to_cand_classes.keys())
+    subset = torch.utils.data.Subset(dataset, unique_sample_indices)
+    grad_bs = min(32, max(1, args.batch_size // 4))
+    subset_loader = torch.utils.data.DataLoader(
+        subset,
+        batch_size=grad_bs,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=True,
+    )
+
+    conf_arr = torch.zeros(num_candidates, dtype=torch.float32, device=device)
+    grad_arr = torch.zeros(num_candidates, dtype=torch.float32, device=device)
+
+    for images, targets, indices in subset_loader:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        original_indices = [int(v) for v in indices.tolist()]
+
+        images.requires_grad_(True)
+        # logits = ensemble_logits(models, images)
+        logits = average_logits(models, images)
+        probs = torch.sigmoid(logits)
+
+        for b, s_idx in enumerate(original_indices):
+            for c_idx, local_i in sample_to_cand_classes[s_idx]:
+                conf_arr[local_i] = torch.abs(probs[b, c_idx] - 0.5).detach()
+                loss_c = F.binary_cross_entropy_with_logits(
+                    logits[b:b + 1, c_idx],
+                    targets[b:b + 1, c_idx].float(),
+                )
+                grad = torch.autograd.grad(loss_c, images, retain_graph=True)[0]
+                grad_arr[local_i] = torch.norm(grad[b].flatten()).detach()
+
+        images.requires_grad_(False)
+
+    conf_thresh = torch.quantile(conf_arr, 1.0 - args.top_conf_ratio)
+    conf_thresh = torch.max(conf_thresh, torch.tensor(args.mee_easy_min_conf, device=device))
+    grad_thresh = torch.quantile(grad_arr, args.mee_easy_grad_ratio)
+    if grad_arr.numel() > 0 and grad_arr.mean() > 0:
+        grad_thresh = torch.min(grad_thresh, grad_arr.mean() * 0.6)
+
+    is_mee = (conf_arr >= conf_thresh) & (grad_arr <= grad_thresh)
+    logger.info(f"    -> MEE easy-noisy thresholds: Conf >= {conf_thresh:.4f}, Grad <= {grad_thresh:.4f}")
+    logger.info(f"    -> MEE easy-noisy labels cut from clean pool: {int(is_mee.sum().item())}")
+
+    if is_mee.any():
+        final_indices = cand_global_indices[is_mee.detach().cpu()]
+        mee_easy_noisy_mask[final_indices[:, 0], final_indices[:, 1]] = True
+    return mee_easy_noisy_mask
+
+@torch.inference_mode()
+def collect_best_ema_signals(ema_models, loader, all_targets, args, device, logger):
+    net1e, net2e = ema_models
+    net1e.eval()
+    net2e.eval()
+
+    num_samples, num_classes = all_targets.shape
+    ema_preds = torch.zeros((num_samples, num_classes), dtype=torch.float32, device=device)
+    ema_vars = torch.zeros_like(ema_preds)
+    ema_losses = torch.zeros_like(ema_preds)
+    class_features_cpu = None
+
+    logger.info("    -> Inferencing whole dataset with peak dual-EMA models and collecting class features...")
+    for images, _, indices in loader:
+        images = images.to(device, non_blocking=True)
+        indices_device = indices.to(device, non_blocking=True)
+
+        logits1, feats1 = _forward_logits_and_features(net1e, images)
+        logits2, feats2 = _forward_logits_and_features(net2e, images)
+        mean_logits = (logits1 + logits2) / 2.0
+        p1 = torch.sigmoid(mean_logits)
+
+        images_hflip = torch.flip(images, dims=[3])
+        logits1_h = _forward_logits(net1e, images_hflip)
+        logits2_h = _forward_logits(net2e, images_hflip)
+        p2 = torch.sigmoid((logits1_h + logits2_h) / 2.0)
+
+        mean_probs = (p1 + p2) / 2.0
+        var_probs = torch.var(torch.stack([p1, p2]), dim=0)
+        targets_batch = all_targets[indices_device].float()
+        losses = F.binary_cross_entropy_with_logits(mean_logits, targets_batch, reduction='none')
+
+        class_features = F.normalize((feats1.float() + feats2.float()) / 2.0, p=2, dim=-1)
+        if class_features_cpu is None:
+            feat_dim = class_features.size(-1)
+            class_features_cpu = torch.empty(
+                (num_samples, num_classes, feat_dim),
+                dtype=torch.float16,
+                device='cpu',
+            )
+
+        ema_preds[indices_device] = mean_probs
+        ema_vars[indices_device] = var_probs
+        ema_losses[indices_device] = losses
+        class_features_cpu[indices] = class_features.detach().cpu().half()
+
+    return ema_preds, ema_vars, ema_losses, class_features_cpu
+
+def build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger):
+    clean_pool_labels = (all_targets.bool() & global_label_mask.bool()).float()
+    co_counts = torch.matmul(clean_pool_labels.T, clean_pool_labels)
+    class_counts = clean_pool_labels.sum(dim=0).clamp(min=1e-5)
+    data_cond_matrix = co_counts / class_counts.unsqueeze(1)
+
+    prior_filename = f'medical_prior_matrix_{args.dataname}.npy'
+    candidate_paths = [
+        os.path.join(args.output, prior_filename) if args.output else None,
+        os.path.join(os.path.dirname(__file__), prior_filename),
+        os.path.join(os.getcwd(), prior_filename),
+        os.path.join('/data/dsj/lys/SqR-NEW/', prior_filename),
+    ]
+    llm_prior_matrix = None
+    for prior_path in candidate_paths:
+        if not prior_path or not os.path.exists(prior_path):
+            continue
+        try:
+            matrix_np = np.load(prior_path, allow_pickle=True).astype(np.float32)
+            if matrix_np.shape[0] != args.num_class:
+                raise ValueError(f"Matrix shape {matrix_np.shape} does not match args.num_class {args.num_class}")
+            llm_prior_matrix = torch.from_numpy(matrix_np).to(device)
+            logger.info(f"    -> Loaded medical prior matrix: {prior_path}")
+            break
+        except Exception as exc:
+            logger.warning(f"    -> Failed to load prior matrix {prior_path}. Reason: {exc}")
+
+    if llm_prior_matrix is None:
+        logger.warning("    -> Falling back to data-driven co-occurrence matrix.")
+        llm_prior_matrix = data_cond_matrix
+
+    alpha = 0.7
+    return alpha * llm_prior_matrix + (1.0 - alpha) * data_cond_matrix
+
 def pick_remove_rate_by_phase(rn, i1, i2, i3, r1, r2, r3, r4):
     if rn <= i1:
         return r1
@@ -400,20 +673,20 @@ def pick_remove_rate_by_phase(rn, i1, i2, i3, r1, r2, r3, r4):
 
 def get_fkl_required_epochs(rn, i1, i2, i3):
     if rn <= i1:
-        return 6
+        return 1
     elif rn <= i1 + i2:
-        return 6
+        return 2
     elif rn <= i1 + i2 + i3:
-        return 6
+        return 3
     else:
-        return 10
+        return 4
 
 @torch.inference_mode()
 def validate_with_meter(models, val_loader, device,args):
     for m in models: 
         m.eval()
         
-    meter = AveragePrecisionMeter()
+    meter = AveragePrecisionMeter(eval_indices=getattr(val_loader.dataset, 'eval_indices', None))
     
     for images, targets, _ in val_loader:
         images = images.to(device, non_blocking=True)
@@ -459,7 +732,7 @@ def main():
         gamma_neg=args.gamma_neg, 
         gamma_pos=args.gamma_pos, 
         base_clip=args.loss_clip, 
-        max_clip=0.2  # 您可以根据 NIH 数据集的噪声严重程度微调此值
+        max_clip=0.1  # 您可以根据 NIH 数据集的噪声严重程度微调此值
     )
     etrain_loader = torch.utils.data.DataLoader(train_dataset_eval, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     num_train_samples = len(train_dataset)
@@ -469,6 +742,8 @@ def main():
         all_targets[indices] = (targets == 1).to(device)
 
     global_label_mask = torch.ones((num_train_samples, args.num_class), dtype=torch.bool).to(device)
+    dynamic_loss_meter = torch.zeros((num_train_samples, args.num_class), dtype=torch.float32).to(device)
+    dynamic_loss_seen = torch.zeros((num_train_samples, args.num_class), dtype=torch.bool).to(device)
     num_rounds = args.i_rate_1 + args.i_rate_2 + args.i_rate_3 + args.i_rate_4
     logger.info(f"=================== Stage 1 Training Start (Multi-Round Mode: {num_rounds} Rounds) ===================")
     
@@ -484,48 +759,30 @@ def main():
         logger.info(f"\n" + "="*20 + f" Starting Round {round_num}/{num_rounds} " + "="*20)
 
         # ======= 修改：将构建 Q2L 替换为构建 DINO =======
-        # net1 = build_dino(args).to(device)
-        # net2 = build_dino(args).to(device)
-        print(f"=> 正在构建 Backbone: ResNet-50 (Pretrained on ImageNet)")
-        try:
-            # 完美修复：全部使用 torchvision.models 前缀
-            weights = torchvision.models.ResNet50_Weights.DEFAULT
-            net1 = torchvision.models.resnet50(weights=weights)
-            net2 = torchvision.models.resnet50(weights=weights)
-        except Exception as e:
-            # 养成好习惯，把异常打印出来看看，而不是默默吞掉
-            print(f"新版权重加载失败 ({e})，回退到 pretrained=True")
-            net1 = torchvision.models.resnet50(pretrained=True)
-            net2 = torchvision.models.resnet50(pretrained=True)
-        num_ftrs1 = net1.fc.in_features
-        num_ftrs2 = net2.fc.in_features
-        net1.fc = nn.Linear(num_ftrs1, args.num_class)
-        net2.fc = nn.Linear(num_ftrs2, args.num_class)
-        # ================= 关键修复：把模型推送到显卡上 =================
-        net1 = net1.to(device)
-        net2 = net2.to(device)
-        # ================================================================
-        # # ==========================================
-        # # 🌟 进阶修复：表征继承 + 决策头重置 (Head Reset)
-        # # ==========================================
-        # best_ckpt_path = os.path.join(args.output, 'best_stage1_model.pth')
-        # if round_num > 1 and os.path.exists(best_ckpt_path):
-        #     logger.info(f"    -> [Continual Learning] Restoring Backbone weights from Round {round_num-1}...")
-        #     checkpoint = torch.load(best_ckpt_path, map_location=device)
+        net1 = build_dino(args).to(device)
+        net2 = build_dino(args).to(device)
+        
+        # ==========================================
+        # 🌟 进阶修复：表征继承 + 决策头重置 (Head Reset)
+        # ==========================================
+        best_ckpt_path = os.path.join(args.output, 'best_stage1_model.pth')
+        if round_num > 1 and os.path.exists(best_ckpt_path):
+            logger.info(f"    -> [Continual Learning] Restoring Backbone weights from Round {round_num-1}...")
+            checkpoint = torch.load(best_ckpt_path, map_location=device)
             
-        #     # 加载全部权重
-        #     net1.load_state_dict(checkpoint['net1'])
-        #     net2.load_state_dict(checkpoint['net2'])
+            # 加载全部权重
+            net1.load_state_dict(checkpoint['net1'])
+            net2.load_state_dict(checkpoint['net2'])
             
-        #     # 【核心逻辑】：重置分类器 (fc) 的权重和偏置
-        #     # 使用 Xavier 均匀分布初始化权重，将偏置清零
-        #     torch.nn.init.xavier_uniform_(net1.fc.weight)
-        #     torch.nn.init.zeros_(net1.fc.bias)
+            # 【核心逻辑】：重置分类器 (fc) 的权重和偏置
+            # 使用 Xavier 均匀分布初始化权重，将偏置清零
+            torch.nn.init.xavier_uniform_(net1.fc.weight)
+            torch.nn.init.zeros_(net1.fc.bias)
             
-        #     torch.nn.init.xavier_uniform_(net2.fc.weight)
-        #     torch.nn.init.zeros_(net2.fc.bias)
+            torch.nn.init.xavier_uniform_(net2.fc.weight)
+            torch.nn.init.zeros_(net2.fc.bias)
             
-        #     logger.info(f"    -> [Head Reset] Successfully re-initialized the Classifier Heads to clear Confirmation Bias!")
+            logger.info(f"    -> [Head Reset] Successfully re-initialized the Classifier Heads to clear Confirmation Bias!")
 
         # 2. 利用继承了 Backbone 但重置了 Head 的 net1/net2 初始化 EMA 老师
         ema1 = ModelEMA(net1, alpha=0.999)
@@ -558,32 +815,15 @@ def main():
         for epoch in range(args.epochs):
             logger.info(f"\n[Round {round_num}/{num_rounds}] Epoch {epoch + 1}/{args.epochs}")
             
-            train_one_epoch_mutual_kd(net1, net2, ema1.ema_model, ema2.ema_model, ema1, ema2, opt1, opt2, train_loader, criterion, args, device, global_label_mask,sch1,sch2,epoch)
+            train_one_epoch_mutual_kd(
+                net1, net2, ema1.ema_model, ema2.ema_model,
+                ema1, ema2, opt1, opt2, train_loader, criterion,
+                args, device, global_label_mask, sch1, sch2, epoch,
+                dynamic_loss_meter, dynamic_loss_seen,
+            )
             
             val_metrics = validate_with_meter(models, val_loader, device,args)
             
-            # val_auroc = val_metrics.get('mAUC', 0.0)
-            # val_macro_f1 = val_metrics.get('macro_F1', 0.0)
-            
-            # logger.info(f"    -> Epoch {epoch + 1} Val mAUC: {val_auroc:.4f} | Macro F1: {val_macro_f1:.4f}")
-            
-            # if val_auroc > best_global_auroc:
-            #     best_global_auroc = val_auroc
-            #     best_ckpt_path = os.path.join(args.output, 'best_stage1_model.pth')
-                
-            #     logger.info(f"    >>> [Best Model] Saving new best model (mAUC: {best_global_auroc:.4f}) to {best_ckpt_path} <<<")
-            #     torch.save({
-            #         'round': round_num,
-            #         'epoch': epoch,
-            #         'net1': net1.state_dict(),
-            #         'net2': net2.state_dict(),
-            #         'net1_ema': ema1.ema_model.state_dict(),
-            #         'net2_ema': ema2.ema_model.state_dict(),
-            #         'best_auroc': best_global_auroc
-            #     }, best_ckpt_path)
-            # ========================================================
-            # 🌟 新增：动态获取目标分数并打印双规日志
-            # ========================================================
             
             current_val_score = val_metrics.get('mAUC', 0.0)
             target_name = "mAUC"
@@ -629,17 +869,10 @@ def main():
                 logger.info(f"    -> Current FkL Candidates: {current_fkl_count} (Dynamic Threshold: {dynamic_threshold})")
                 logger.info(f"    -> Current pool size: {current_pool_size})")
                 
-                if (current_fkl_count >= dynamic_threshold and epoch >= 12) or epoch == args.epochs - 1:
+                if current_fkl_count >= dynamic_threshold or epoch == args.epochs - 1:
                     negative_targets_mask = ~all_targets
-                    if round_num == 1:
-                        logger.info(f"\n>>> [Round 1] Executing Label-Level Early Cutting (Blacklist Mode)... <<<")
-                        fkl_mask, mee_noisy_mask = perform_label_level_early_cutting(models, train_dataset_eval, fkl_mask, args, logger, device,all_targets)
-                        
-                        global_label_mask = global_label_mask & (fkl_mask | negative_targets_mask) & (~mee_noisy_mask)
-                    else:
-                        logger.info(f"\n>>> [Round {round_num}] Using pure FkL filtering (Whitelist Mode)... <<<")
-                        
-                        global_label_mask = global_label_mask & (fkl_mask | negative_targets_mask)    
+                    logger.info(f"\n>>> [Round {round_num}] Using pure FkL filtering (Whitelist Mode)... <<<")  
+                    global_label_mask = global_label_mask & (fkl_mask | negative_targets_mask)    
                     # 判断是否是最后一轮
                     #用于将噪声标签进行修改
                     if round_num == num_rounds:
@@ -658,6 +891,180 @@ def main():
                             logger.info(f"    -> Successfully restored EMA models to their peak performance (Val mAUC: {checkpoint['best_auroc']:.4f} at Round {checkpoint['round']}, Epoch {checkpoint['epoch']})")
                         else:
                             logger.warning("    -> Best checkpoint not found! Using the final epoch's degraded models instead.")
+                        ema_preds, ema_vars, ema_losses, class_features_cpu = collect_best_ema_signals(
+                            (ema1.ema_model, ema2.ema_model),
+                            etrain_loader,
+                            all_targets,
+                            args,
+                            device,
+                            logger,
+                        )
+
+                        if args.enable_label_reliability:
+                            logger.info("    -> Running label-level Loss-GMM / MEE / Prototype / KNN reliability fusion...")
+                            loss_gmm_losses = torch.where(dynamic_loss_seen, dynamic_loss_meter, ema_losses)
+                            active_positive_mask = all_targets.bool() & global_label_mask.bool()
+                            loss_clean_mask, loss_risk_mask = loss_gmm_split(
+                                loss_gmm_losses,
+                                active_positive_mask,
+                                min_pos=args.loss_gmm_min_pos,
+                                prob_thresh=args.loss_gmm_prob_thresh,
+                                seed=args.seed,
+                            )
+                            easy_check_candidates = suspicious_high_loss_mask(
+                                ema_losses,
+                                loss_clean_mask,
+                                top_ratio=args.mee_easy_loss_top_ratio,
+                                min_std=args.mee_easy_loss_min_std,
+                            )
+                            ema_models_for_reliability = (
+                                ema1.ema_model,
+                                ema2.ema_model
+                            )
+                            mee_easy_noisy_mask = perform_mee_easy_noisy_check(
+                                ema_models_for_reliability,
+                                train_dataset_eval,
+                                easy_check_candidates,
+                                args,
+                                logger,
+                                device,
+                                all_targets,
+                            )
+                            #最终干净标签的判断,下面这两个对于干净标签的判别法则不同
+                            # seed_clean_mask = (loss_clean_mask & (~mee_easy_noisy_mask)) | (all_targets & global_label_mask)
+                            seed_clean_mask = (
+                                active_positive_mask
+                                & loss_clean_mask.bool()
+                                & (~mee_easy_noisy_mask.bool())
+                            )
+                            class_features = class_features_cpu.to(device=device, dtype=torch.float32)
+                            #计算类原型区分下的干净标签和噪声标签
+                            proto_clean_mask, proto_noisy_mask, proto_sim = prototype_gmm_evidence(
+                                class_features,
+                                all_targets,
+                                seed_clean_mask,
+                                min_pos=args.proto_gmm_min_pos,
+                                prob_thresh=args.proto_gmm_prob_thresh,
+                                seed=args.seed,
+                            )
+                            support_mask = seed_clean_mask | proto_clean_mask
+                            knn_clean_mask, knn_noisy_mask, knn_purity = knn_purity_evidence(
+                                class_features,
+                                all_targets,
+                                support_mask,
+                                k=args.knn_k,
+                                chunk_size=args.knn_chunk_size,
+                                tail_cutoff=args.knn_tail_cutoff,
+                                mid_cutoff=args.knn_mid_cutoff,
+                                tail_purity=args.knn_tail_purity,
+                                mid_purity=args.knn_mid_purity,
+                                head_purity=args.knn_head_purity,
+                            )
+                            dynamic_hard_clean_mask = build_dynamic_hard_clean_mask(
+                                loss_risk_mask,
+                                fkl_mask,
+                                ema_preds,
+                                ema_vars,
+                                proto_clean_mask,
+                                knn_clean_mask,
+                                ema_thresh=args.hard_clean_ema_thresh,
+                                var_thresh=args.hard_clean_var_thresh,
+                            )
+                            label_reliability, fp_mask, hard_clean_mask, clear_noisy_fp = build_label_reliability(
+                                all_targets,
+                                global_label_mask,
+                                loss_clean_mask,
+                                loss_risk_mask,
+                                mee_easy_noisy_mask,
+                                dynamic_hard_clean_mask,
+                                proto_clean_mask,
+                                proto_noisy_mask,
+                                knn_clean_mask,
+                                knn_noisy_mask,
+                                fkl_mask,
+                            )
+                            cond_prob_matrix = build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger)
+                            fn_mask = mine_false_negative_mask(
+                                all_targets,
+                                ema_preds,
+                                ema_vars,
+                                proto_sim,
+                                knn_purity,
+                                cond_prob_matrix,
+                                ema_thresh=args.fn_ema_thresh,
+                                var_thresh=args.fn_var_thresh,
+                                proto_sim_thresh=args.fn_proto_sim_thresh,
+                                knn_purity_thresh=args.fn_knn_purity_thresh,
+                                prior_thresh=args.fn_prior_thresh,
+                            )
+                            final_soft_targets = generate_asymmetric_soft_targets(
+                                all_targets,
+                                ema_preds,
+                                label_reliability,
+                                fp_mask,
+                                clear_noisy_fp,
+                                hard_clean_mask,
+                                fn_mask,
+                                fp_soft_max=args.fp_soft_max,
+                            )
+
+                            diagnostic_tensors = {
+                                'label_reliability': label_reliability,
+                                'fp_mask': fp_mask,
+                                'fn_mask': fn_mask,
+                                'hard_clean_mask': hard_clean_mask,
+                                'loss_clean_mask': loss_clean_mask,
+                                'loss_risk_mask': loss_risk_mask,
+                                'mee_easy_noisy_mask': mee_easy_noisy_mask,
+                                'dynamic_hard_clean_mask': dynamic_hard_clean_mask,
+                                'proto_clean_mask': proto_clean_mask,
+                                'proto_noisy_mask': proto_noisy_mask,
+                                'knn_clean_mask': knn_clean_mask,
+                                'knn_noisy_mask': knn_noisy_mask,
+                            }
+                            save_reliability_outputs(args.output, diagnostic_tensors)
+                            save_reliability_summary(args.output, all_targets, diagnostic_tensors)
+                            del class_features
+                        else:
+                            logger.info("    -> Label reliability fusion disabled; using legacy EMA FP/FN correction.")
+                            label_reliability = torch.ones_like(ema_preds)
+                            fp_mask = (all_targets == 1) & (~global_label_mask)
+                            clear_noisy_fp = fp_mask
+                            hard_clean_mask = all_targets & (~fp_mask)
+                            cond_prob_matrix = build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger)
+                            fn_mask = mine_false_negative_mask(
+                                all_targets,
+                                ema_preds,
+                                ema_vars,
+                                None,
+                                None,
+                                cond_prob_matrix,
+                                ema_thresh=args.fn_ema_thresh,
+                                var_thresh=args.fn_var_thresh,
+                                prior_thresh=args.fn_prior_thresh,
+                            )
+                            final_soft_targets = generate_asymmetric_soft_targets(
+                                all_targets,
+                                ema_preds,
+                                label_reliability,
+                                fp_mask,
+                                clear_noisy_fp,
+                                hard_clean_mask,
+                                fn_mask,
+                                fp_soft_max=args.fp_soft_max,
+                            )
+
+                        output_path = os.path.join(args.output, 'asymmetric_soft_targets.pt')
+                        torch.save(final_soft_targets.detach().cpu(), output_path)
+                        logger.info("="*60)
+                        logger.info(" >>> Stage 1 Split Complete (Multi-Evidence Label-Level Soft Correction)! ")
+                        logger.info(f"     * FP labels softened: {int(fp_mask.sum().item())}")
+                        logger.info(f"     * FN labels mined:    {int(fn_mask.sum().item())}")
+                        logger.info(f"     * Saved soft targets to: {output_path}")
+                        logger.info(" >>> Exiting Stage 1 gracefully to start Stage 2. <<<")
+                        logger.info("="*60)
+                        sys.stdout.flush()
+                        sys.exit(0)
 
                         # ==========================================
                         # 0. 准备 ema_preds 和 ema_vars (新增方差矩阵)
@@ -696,7 +1103,7 @@ def main():
                         # 处理 FP (保持不变，但加入极值压制防坍塌)
                         fp_mask = (all_targets == 1) & (~global_label_mask)
                         # final_soft_targets[fp_mask] = torch.clamp(ema_preds[fp_mask], max=0.5) 
-                        final_soft_targets[fp_mask] = torch.clamp(ema_preds[fp_mask], max=0.3) 
+                        final_soft_targets[fp_mask] = torch.clamp(ema_preds[fp_mask], max=1) 
 
                         # ==========================================
                         # 🌟 重大升级：引入医学大模型 (LLM) 先验知识矩阵
@@ -791,43 +1198,6 @@ def main():
                         
                         sys.stdout.flush() 
                         sys.exit(0)
-                    # 只处理噪声样本和干净样本的划分，不修改标签
-                    # if round_num == num_rounds:
-                    #     logger.info(f"\n>>> Final Round {round_num} Reached. Executing Sample-Level Voting & Exiting! <<<")
-                        
-                    #     total_positives = all_targets.sum(dim=1) 
-                    #     clean_pos_counts = (global_label_mask & all_targets).sum(dim=1)
-                    #     noisy_pos_counts = (~global_label_mask & all_targets).sum(dim=1)
-                        
-                    #     is_clean_sample = torch.zeros(num_train_samples, dtype=torch.bool).to(device)
-                        
-                    #     has_pos = total_positives > 0
-                    #     is_clean_sample[has_pos] = clean_pos_counts[has_pos] > noisy_pos_counts[has_pos]
-                        
-                    #     no_pos = total_positives == 0
-                    #     is_clean_sample[no_pos] = True
-                        
-                    #     clean_indices = torch.nonzero(is_clean_sample).squeeze(1).tolist()
-                    #     noisy_indices = torch.nonzero(~is_clean_sample).squeeze(1).tolist()
-                        
-                    #     noise_clean_labels_dict = {}
-                    #     for n_idx in noisy_indices:
-                    #         clean_lbls = torch.nonzero(global_label_mask[n_idx]).squeeze(1).tolist()
-                    #         noise_clean_labels_dict[int(n_idx)] = clean_lbls
-
-                    #     torch.save(clean_indices, os.path.join(args.output, 'clean_indices.pt'))
-                    #     torch.save(noisy_indices, os.path.join(args.output, 'noisy_indices.pt'))
-                    #     torch.save(noise_clean_labels_dict, os.path.join(args.output, 'noise_clean_labels_dict.pt'))
-                        
-                    #     logger.info("="*60)
-                    #     logger.info(f" >>> Stage 1 Split Complete! ")
-                    #     logger.info(f"     * Clean Samples: {len(clean_indices)}")
-                    #     logger.info(f"     * Noisy Samples: {len(noisy_indices)}")
-                    #     logger.info(" >>> Exiting Stage 1 gracefully to start Stage 2  . <<<")
-                    #     logger.info("="*60)
-                        
-                    #     sys.stdout.flush() 
-                    #     sys.exit(0)
                     else:
                         logger.info(f">>> Round {round_num} Completed. Breaking inner loop to start Round {round_num + 1}. <<<")
                         break  

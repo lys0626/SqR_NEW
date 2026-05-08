@@ -16,7 +16,7 @@ def evaluate_stage1_correction():
         ).cpu()
         
         soft_targets = torch.load(
-            f'/data/dsj/lys/SqR-NEW/experiment/VINVIG/5_2_Resnet50_12_0.98_old_0.2_asym_resnet50/vinbigdata/stage1_splicemix-cl/asymmetric_soft_targets.pt', 
+            f'/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/5_8_0.94_0.95_4_asym_0.2/vinbigdata/stage1_splicemix-cl/asymmetric_soft_targets.pt', 
             weights_only=True
         ).cpu()
     except Exception as e:

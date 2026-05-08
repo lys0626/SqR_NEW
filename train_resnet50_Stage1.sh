@@ -3,7 +3,7 @@
 set -e  # <--- [强烈建议新增] 只要发生任何报错，脚本立刻停止，绝不往下瞎跑！
 
 # ================= 1. 基础全局配置 =================
-GPU_ID=3
+GPU_ID=1
 # export CUDA_VISIBLE_DEVICES=${GPU_ID}      # 指定使用的单卡 GPU 编号
 
 # DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
@@ -21,7 +21,7 @@ DATA_DIR="/data/dsj/lys/vinbigdata"
 # DATASET_NAME_UPPER="CHEXPERT"
 # DATA_DIR="/data/chexpert_224"
 
-EXP_DIR="./experiment/VINVIG/5_2_Resnet50_12_0.94_old_0.5_sym_resnet50"        # 实验输出的顶层根目录
+EXP_DIR="./experiment/VINVIG_denoise/5_8_0.95_4_sym_0.2"        # 实验输出的顶层根目录
 # EXP_DIR="./experiment/vision"
 # ================= 2. 方法选择配置 =================
 # 可选值: "splicemix" 或 "splicemix-cl"，或 baseline（不使用任何增强）
@@ -41,6 +41,8 @@ echo "==================================================="
   # --noise_type asym \
   # --fn_rate 0.5 \
   # --fp_rate 0.5 \
+  # --noise_type sym \
+  # --sym_rate 0.2
 python stage1_main_resnet50.py \
   --dataname "${DATASET_NAME}" \
   --dataset_dir "${DATA_DIR}" \
@@ -54,7 +56,7 @@ python stage1_main_resnet50.py \
   --fkl_consecutive_epochs 8 \
   --optim AdamW \
   --early_cutting_rate 5 \
-  --warm_up_epochs 12 \
+  --warm_up_epochs 0 \
   --inject_noise \
   --noise_type sym \
-  --sym_rate 0.5
+  --sym_rate 0.2

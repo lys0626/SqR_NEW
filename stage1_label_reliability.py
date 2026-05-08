@@ -86,6 +86,7 @@ def suspicious_high_loss_mask(losses, candidate_mask, top_ratio=0.3, min_std=0.5
             continue
         values = losses[idx, c].float()
         top_ratio_cut = torch.quantile(values, max(0.0, min(1.0, 1.0 - top_ratio)))
+        #设置一个选择标注错误简单样本的最低阈值，防止将loss很低但是在整个干净子集中排名较前的干净标签视为标注错误的简单标签
         deviation_cut = values.mean() + max(0.0, min_std) * values.std(unbiased=False)
         threshold = torch.maximum(top_ratio_cut, deviation_cut)
         selected[idx[values >= threshold], c] = True

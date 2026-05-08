@@ -1,4 +1,4 @@
-GPU_ID=4
+GPU_ID=6
 # export CUDA_VISIBLE_DEVICES=${GPU_ID}      # 指定使用的单卡 GPU 编号
 
 # DATASET_NAME="mimic"                     # 数据集名称小写 (给 Stage1 用: mimic, nih 等)
@@ -20,7 +20,7 @@ EXP_DIR="/data/dsj/lys/SqR-NEW/experiment/PADCHEST/"        # 实验输出的顶
 
 # ================= 2. 方法选择配置 =================
 # 可选值: "splicemix" 或 "splicemix-cl"，或 baseline
-STAGE2_METHOD="splicemix"             
+STAGE2_METHOD="baseline"             
 STAGE2_OUT="${EXP_DIR}/${DATASET_NAME}/stage2_${STAGE2_METHOD}"
 mkdir -p "${STAGE2_OUT}"
 #指定软标签的路径
@@ -48,7 +48,7 @@ python stage2_main.py \
   --model "${MODEL_ARG}" \
   -mixer "${MIXER_ARG}" \
   --epochs 100 \
-  --batch-size 128 \
+  --batch-size 256 \
   --optimizer SGD \
   --lr 0.05 \
   --warmup-epochs 5 \

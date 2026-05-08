@@ -192,13 +192,13 @@ def parser_args():
     parser.add_argument('--orid_norm', action='store_true', default=False)
 
     # Phase 控制参数
-    parser.add_argument("--i_rate_1", type=int, default=3)
-    parser.add_argument("--i_rate_2", type=int, default=3)
+    parser.add_argument("--i_rate_1", type=int, default=2)
+    parser.add_argument("--i_rate_2", type=int, default=2)
     parser.add_argument("--i_rate_3", type=int, default=0)
     parser.add_argument("--i_rate_4", type=int, default=0)
     
-    parser.add_argument("--remove_rate_1", type=float, default=0.995)
-    parser.add_argument("--remove_rate_2", type=float, default=0.995)
+    parser.add_argument("--remove_rate_1", type=float, default=0.95)
+    parser.add_argument("--remove_rate_2", type=float, default=0.95)
     parser.add_argument("--remove_rate_3", type=float, default=0.995)
     parser.add_argument("--remove_rate_4", type=float, default=0.995)
 
@@ -273,6 +273,9 @@ def ensemble_logits(models, x):
     out1e = _forward_logits(net1e, x)
     out2e = _forward_logits(net2e, x)
     return (out1 + out2 + out1e + out2e) / 4.0
+def average_logits(models, x):
+    logits = [_forward_logits(model, x) for model in models]
+    return torch.stack(logits, dim=0).mean(dim=0)
 import torchvision.transforms as T
 
 # 在 stage1_main_dinov2.py 文件顶部引入 RandomErasing
@@ -460,7 +463,8 @@ def perform_label_level_early_cutting(models, dataset, fkl_mask, args, logger, d
         indices = indices.numpy()
         
         images.requires_grad_(True)
-        logits = ensemble_logits(models, images)
+        # logits = ensemble_logits(models, images)
+        logits = average_logits(models, images)
         probs = torch.sigmoid(logits)
         
         for b in range(len(indices)):
@@ -545,7 +549,8 @@ def perform_mee_easy_noisy_check(models, dataset, candidate_mask, args, logger, 
         original_indices = [int(v) for v in indices.tolist()]
 
         images.requires_grad_(True)
-        logits = ensemble_logits(models, images)
+        # logits = ensemble_logits(models, images)
+        logits = average_logits(models, images)
         probs = torch.sigmoid(logits)
 
         for b, s_idx in enumerate(original_indices):
@@ -727,7 +732,7 @@ def main():
         gamma_neg=args.gamma_neg, 
         gamma_pos=args.gamma_pos, 
         base_clip=args.loss_clip, 
-        max_clip=0.2  # 您可以根据 NIH 数据集的噪声严重程度微调此值
+        max_clip=0.1  # 您可以根据 NIH 数据集的噪声严重程度微调此值
     )
     etrain_loader = torch.utils.data.DataLoader(train_dataset_eval, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     num_train_samples = len(train_dataset)
