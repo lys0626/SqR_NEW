@@ -6,22 +6,50 @@ from torch.utils.data import Dataset
 
 class chexpert(Dataset):
     task = 'multilabel'
-    # num_labels = 13
+#     num_labels = 14
     
-    # label_names = [
-    #     'Enlarged Cardiomediastinum', 'Cardiomegaly', 'Lung Opacity',
-    #     'Lung Lesion', 'Edema', 'Consolidation', 'Pneumonia', 'Atelectasis',
-    #     'Pneumothorax', 'Pleural Effusion', 'Pleural Other', 'Fracture',
-    #     'Support Devices'
-    # ]
-    num_labels = 14
+#     label_names = [
+#     'No Finding',
+#     'Enlarged Cardiomediastinum',
+#     'Cardiomegaly',
+#     'Lung Opacity',
+#     'Lung Lesion',
+#     'Edema',
+#     'Consolidation',
+#     'Pneumonia',
+#     'Atelectasis',
+#     'Pneumothorax',
+#     'Pleural Effusion',
+#     'Pleural Other',
+#     'Fracture',
+#     'Support Devices',
+# ]
+#     num_labels=5
+#     label_names = [
+#     'Atelectasis',
+#     'Cardiomegaly',
+#     'Consolidation',
+#     'Edema',
+#     'Pleural Effusion',
+# ]
+    num_labels = 13
     
     label_names = [
-        'Enlarged Cardiomediastinum', 'Cardiomegaly', 'Lung Opacity',
-        'Lung Lesion', 'Edema', 'Consolidation', 'Pneumonia', 'Atelectasis',
-        'Pneumothorax', 'Pleural Effusion', 'Pleural Other', 'Fracture',
-        'Support Devices', 'No Finding'
-    ]
+    'No Finding',
+    'Enlarged Cardiomediastinum',
+    'Cardiomegaly',
+    'Lung Opacity',
+    'Lung Lesion',
+    'Edema',
+    'Consolidation',
+    'Pneumonia',
+    'Atelectasis',
+    'Pneumothorax',
+    'Pleural Effusion',
+    'Pleural Other',
+    'Support Devices',
+]
+
     def __init__(self, root='/data/chexpert_224', mode='train', transform=None):
         self.root = root
         self.transform = transform

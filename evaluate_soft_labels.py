@@ -6,17 +6,17 @@ def evaluate_stage1_correction():
     # 2. 加载三个张量：加上 weights_only=True 消除警告，加上 .cpu() 统一移动到内存
     try:
         clean_labels = torch.load(
-            f'/data/dsj/lys/vinbigdata/clean_labels_gt.pt', 
+            f'/data/dsj/lys/vinbigdata/5_9_0.94_0.95_4_asym_0.2_0.2_noFN/clean_labels_gt.pt', 
             weights_only=True
         ).cpu()
         
         noisy_labels = torch.load(
-            f'/data/dsj/lys/vinbigdata/noisy_labels_ASYM_FN0.2_FP0.2_Total0.230.pt', 
+            f'/data/dsj/lys/vinbigdata/5_9_0.94_0.95_4_asym_0.2_0.2_noFN/noisy_labels_ASYM_FN0.2_FP0.2_Total0.230.pt', 
             weights_only=True
         ).cpu()
         
         soft_targets = torch.load(
-            f'/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/5_8_0.94_0.95_4_asym_0.2/vinbigdata/stage1_splicemix-cl/asymmetric_soft_targets.pt', 
+            f'/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/5_9_0.94_0.95_4_asym_0.2_0.2_noFN/vinbigdata/stage1_splicemix-cl/asymmetric_soft_targets.pt', 
             weights_only=True
         ).cpu()
     except Exception as e:

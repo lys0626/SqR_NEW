@@ -209,7 +209,7 @@ def build_dynamic_hard_clean_mask(loss_risk_mask, fkl_mask, ema_preds, ema_vars,
     return loss_risk_mask & dynamic_support & (proto_clean | knn_clean)
 
 
-
+#标签可信度，用于判断每个正标签是可信干净标签，疑似假阳性标签，还是介于中间需要软化的标签
 def build_label_reliability(
     targets,
     global_label_mask,
@@ -226,6 +226,8 @@ def build_label_reliability(
     targets = targets.bool()
     positive = targets
     active_positive = positive & global_label_mask.bool()
+    #均是对标签值为1的标签进行处理
+    #干净得分
     clean_score = (
         0.6 * loss_clean_mask.float()
         + 0.8 * global_label_mask.float()
@@ -234,6 +236,7 @@ def build_label_reliability(
         + 0.5 * proto_clean_mask.float()
         + 0.5 * knn_clean_mask.float()
     )
+    #噪声得分
     noisy_score = (
         0.7 * loss_risk_mask.float()
         + 1.2 * mee_easy_noisy_mask.float()
@@ -251,26 +254,40 @@ def build_label_reliability(
     # retained positive pool. High-loss labels still need EMA or geometry support
     # to be recovered as difficult clean labels.
 
-    #困难干净标签
+    #这里计算的是全部的干净标签
     hard_clean_mask = active_positive & (
         dynamic_hard_clean_mask.bool()
         | (loss_clean_mask.bool() & (~mee_easy_noisy_mask.bool()))
     )
-    #疑似假阳性
+    #确认假阳性
+    # clear_noisy_fp = positive & (
+    #     mee_easy_noisy_mask.bool()
+    #     | ((loss_risk_mask.bool() | (~global_label_mask.bool())) & proto_noisy_mask.bool() & knn_noisy_mask.bool())
+    # ) & (~hard_clean_mask)
+
     clear_noisy_fp = positive & (
         mee_easy_noisy_mask.bool()
-        | ((loss_risk_mask.bool() | (~global_label_mask.bool())) & proto_noisy_mask.bool() & knn_noisy_mask.bool())
+        | ((loss_risk_mask.bool() | (~global_label_mask.bool()))  & knn_noisy_mask.bool())
     ) & (~hard_clean_mask)
-    #确认假阳性
-    fp_mask = positive & (~hard_clean_mask) & (
-        clear_noisy_fp
-        | (~global_label_mask.bool())
-        | (reliability < 0.5)
-    )
 
+    #疑似假阳性，最终模型保存的是这个，但是精确度确是很高
+    # fp_mask = positive & (~hard_clean_mask) & (
+    #     clear_noisy_fp
+    #     | (~global_label_mask.bool())
+    #     | (reliability < 0.5)
+    # )
+
+    #将fp_mask进行修改查看噪声标签的精确率和召回率的改变
+    fp_mask = positive & (~hard_clean_mask)
+
+
+    # reliability：每个标签的可靠性分数，范围大约是 [0, 1]。
+    # fp_mask：疑似 false positive，也就是原本标为 1、但现在怀疑是噪声的标签。
+    # hard_clean_mask：确认保留的干净正标签，不应该被软化。
+    # clear_noisy_fp：更明确的假阳性噪声标签，比 fp_mask 更强
     return reliability, fp_mask, hard_clean_mask, clear_noisy_fp
 
-
+#用于挖掘假阴性标签
 def mine_false_negative_mask(
     targets,
     ema_preds,
@@ -287,7 +304,7 @@ def mine_false_negative_mask(
     targets = targets.bool()
     fn_mask = torch.zeros_like(targets, dtype=torch.bool)
     num_samples, num_classes = targets.shape
-
+    #挑选标签值为0但是模型对其预测均值大于给定阈值，对齐预测方差小于给定阈值的子集
     for c in range(num_classes):
         candidate = (
             (~targets[:, c])

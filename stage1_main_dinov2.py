@@ -122,6 +122,8 @@ def parser_args():
     # == 原有基础参数 ==
     parser.add_argument('--dataname', default='nih', choices=['coco14', 'mimic', 'nih','chexpert', 'vinbigdata', 'padchest'])
     parser.add_argument('--dataset_dir', default='/comp_robot')
+    parser.add_argument('--padchest_label_set', default='lt189', choices=['lt189', 'xrv18'],
+                        help='PadChest label space: original LT labels or XRV18 NIH/MIMIC union projection.')
     parser.add_argument('--img_size', default=224, type=int) # 注意：必须是 14 的倍数
     parser.add_argument('--output', metavar='DIR', help='path to output folder')
     parser.add_argument('--num_class', default=14, type=int)
@@ -177,7 +179,8 @@ def parser_args():
     parser.add_argument('--fn_proto_sim_thresh', default=0.35, type=float)
     parser.add_argument('--fn_knn_purity_thresh', default=0.05, type=float)
     parser.add_argument('--fn_prior_thresh', default=0.2, type=float)
-
+    parser.add_argument('--disable_fn_mining', action='store_true', default=False,
+                        help='关闭 Stage1 假阴性挖掘，仅保留假阳性修正')
     # ================= 标签级 MEE 核心对齐参数 =================
     parser.add_argument('--warm_up_epochs', default=6, type=int, help='前几个 Epoch 不记录 FkL')
     parser.add_argument('--fkl_consecutive_epochs', default=5, type=int, help='需要连续多少次预测正确才算候选干净标签')
@@ -197,7 +200,7 @@ def parser_args():
     parser.add_argument("--i_rate_3", type=int, default=0)
     parser.add_argument("--i_rate_4", type=int, default=0)
     
-    parser.add_argument("--remove_rate_1", type=float, default=0.95)
+    parser.add_argument("--remove_rate_1", type=float, default=0.94)
     parser.add_argument("--remove_rate_2", type=float, default=0.95)
     parser.add_argument("--remove_rate_3", type=float, default=0.995)
     parser.add_argument("--remove_rate_4", type=float, default=0.995)
@@ -983,20 +986,24 @@ def main():
                                 knn_noisy_mask,
                                 fkl_mask,
                             )
-                            cond_prob_matrix = build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger)
-                            fn_mask = mine_false_negative_mask(
-                                all_targets,
-                                ema_preds,
-                                ema_vars,
-                                proto_sim,
-                                knn_purity,
-                                cond_prob_matrix,
-                                ema_thresh=args.fn_ema_thresh,
-                                var_thresh=args.fn_var_thresh,
-                                proto_sim_thresh=args.fn_proto_sim_thresh,
-                                knn_purity_thresh=args.fn_knn_purity_thresh,
-                                prior_thresh=args.fn_prior_thresh,
-                            )
+                            if args.disable_fn_mining:
+                                logger.info("    -> FN mining disabled by --disable_fn_mining; fn_mask is all False.")
+                                fn_mask = torch.zeros_like(all_targets, dtype=torch.bool)
+                            else:
+                                cond_prob_matrix = build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger)
+                                fn_mask = mine_false_negative_mask(
+                                    all_targets,
+                                    ema_preds,
+                                    ema_vars,
+                                    proto_sim,
+                                    knn_purity,
+                                    cond_prob_matrix,
+                                    ema_thresh=args.fn_ema_thresh,
+                                    var_thresh=args.fn_var_thresh,
+                                    proto_sim_thresh=args.fn_proto_sim_thresh,
+                                    knn_purity_thresh=args.fn_knn_purity_thresh,
+                                    prior_thresh=args.fn_prior_thresh,
+                                )
                             final_soft_targets = generate_asymmetric_soft_targets(
                                 all_targets,
                                 ema_preds,
@@ -1031,18 +1038,22 @@ def main():
                             fp_mask = (all_targets == 1) & (~global_label_mask)
                             clear_noisy_fp = fp_mask
                             hard_clean_mask = all_targets & (~fp_mask)
-                            cond_prob_matrix = build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger)
-                            fn_mask = mine_false_negative_mask(
-                                all_targets,
-                                ema_preds,
-                                ema_vars,
-                                None,
-                                None,
-                                cond_prob_matrix,
-                                ema_thresh=args.fn_ema_thresh,
-                                var_thresh=args.fn_var_thresh,
-                                prior_thresh=args.fn_prior_thresh,
-                            )
+                            if args.disable_fn_mining:
+                                logger.info("    -> FN mining disabled by --disable_fn_mining; fn_mask is all False.")
+                                fn_mask = torch.zeros_like(all_targets, dtype=torch.bool)
+                            else:
+                                cond_prob_matrix = build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger)
+                                fn_mask = mine_false_negative_mask(
+                                    all_targets,
+                                    ema_preds,
+                                    ema_vars,
+                                    None,
+                                    None,
+                                    cond_prob_matrix,
+                                    ema_thresh=args.fn_ema_thresh,
+                                    var_thresh=args.fn_var_thresh,
+                                    prior_thresh=args.fn_prior_thresh,
+                                )
                             final_soft_targets = generate_asymmetric_soft_targets(
                                 all_targets,
                                 ema_preds,

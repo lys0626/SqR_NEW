@@ -1,5 +1,5 @@
 import numpy as np
-
+# 按照比例进行假阳性和假阴性的翻转
 def inject_multilabel_noise(clean_labels, noise_type='asym', sym_rate=0.2, fn_rate=0.3, fp_rate=0.05, random_seed=42, no_finding_idx=14):
     """
     终极版多标签噪声注入器 (支持一键切换对称/非对称，且保证临床逻辑互斥)
@@ -51,3 +51,4 @@ def inject_multilabel_noise(clean_labels, noise_type='asym', sym_rate=0.2, fn_ra
     print(f"[Noise Injector] 实际总体标签破坏率: {actual_total_noise_rate:.4f}")
     
     return noisy_labels, actual_total_noise_rate, noise_type
+

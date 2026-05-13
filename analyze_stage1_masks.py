@@ -144,21 +144,18 @@ def main():
     )
     parser.add_argument(
         "--noisy-labels",
-        default="/data/dsj/lys/vinbigdata/noisy_labels_ASYM_FN0.2_FP0.2_Total0.230.pt",
+        default="/data/dsj/lys/vinbigdata/noisy_labels_ASYM_FN0.2_FP0.2_Total0.200.pt",
         help="Path to injected-noise labels used by Stage1.",
     )
-    parser.add_argument("--soft-targets", default='/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/5_8_0.94_0.95_4_asym_0.2/vinbigdata/stage1_splicemix-cl/asymmetric_soft_targets.pt')
-    parser.add_argument("--fp-mask", default='/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/5_8_0.94_0.95_4_asym_0.2/vinbigdata/stage1_splicemix-cl/fp_mask.pt')
-    parser.add_argument("--fn-mask", default='/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/5_8_0.94_0.95_4_asym_0.2/vinbigdata/stage1_splicemix-cl/fn_mask.pt')
-    parser.add_argument("--threshold", default=0.5, type=float)
-    parser.add_argument("--csv-out", default='/data/dsj/lys/vinbigdata/noise_1')
+    parser.add_argument("--soft-targets", default='/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/END/5_13_0.94_0.95_4_asym_0.2_0.2_0.8_0.1_all_loss_clean_0.35KNN/vinbigdata/stage1_splicemix-cl/asymmetric_soft_targets.pt')
+    parser.add_argument("--fp-mask", default='/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/END/5_13_0.94_0.95_4_asym_0.2_0.2_0.8_0.1_all_loss_clean_0.35KNN/vinbigdata/stage1_splicemix-cl/fp_mask.pt')
+    parser.add_argument("--fn-mask", default='/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/END/5_13_0.94_0.95_4_asym_0.2_0.2_0.8_0.1_all_loss_clean_0.35KNN/vinbigdata/stage1_splicemix-cl/fn_mask.pt')
+    parser.add_argument("--threshold", default=0.7, type=float)
     args = parser.parse_args()
 
-    soft_path = args.soft_targets or os.path.join(args.stage1_dir, "asymmetric_soft_targets.pt")
-    fp_path = args.fp_mask or os.path.join(args.stage1_dir, "fp_mask.pt")
-    fn_path = args.fn_mask or os.path.join(args.stage1_dir, "fn_mask.pt")
-    csv_out = args.csv_out or os.path.join(args.stage1_dir, "stage1_mask_diagnosis.csv")
-
+    soft_path = args.soft_targets 
+    fp_path = args.fp_mask 
+    fn_path = args.fn_mask 
     clean = load_tensor(args.clean_labels).bool()
     noisy = load_tensor(args.noisy_labels).bool()
     soft = load_tensor(soft_path).float()
@@ -211,17 +208,6 @@ def main():
     print(f"    其中落在 fn_mask 中的数量: {count(degraded_clean_neg & fn_mask)}")
     print()
 
-    print("Mask 基本一致性检查")
-    print(f"  fp_mask 选到原始阴性标签的数量: {count(fp_mask & (~noisy))}")
-    print(f"  fn_mask 选到原始阳性标签的数量: {count(fn_mask & noisy)}")
-    print(f"  fp_mask 与 fn_mask 重叠数量: {count(fp_mask & fn_mask)}")
-    print()
-
-    rows = per_class_rows(clean, noisy, soft_pred, fp_mask, fn_mask)
-    print_top(rows, "fn_false_clean_neg", "干净阴性标签被 fn_mask 错误挖掘最多的类别")
-    print_top(rows, "fp_false_clean_pos", "干净阳性标签被 fp_mask 错误降权最多的类别")
-    print_top(rows, "clean_neg_degraded", "最终干净阴性标签被错误改成阳性最多的类别")
-    print_top(rows, "clean_pos_degraded", "最终干净阳性标签被错误改成阴性最多的类别")
 
 
 

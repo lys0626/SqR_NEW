@@ -107,12 +107,34 @@ def get_datasets(args):
             val_dataset = VinBigDataDataset(root=args.dataset_dir, mode='valid', transform=test_data_transform)
         args.num_class = train_dataset.get_number_classes()
     elif args.dataname == 'padchest':
-        train_dataset = padchest(root=args.dataset_dir, mode='train', transform=train_data_transform)
+        padchest_label_set = getattr(args, 'padchest_label_set', 'lt189')
+        train_dataset = padchest(
+            root=args.dataset_dir,
+            mode='train',
+            transform=train_data_transform,
+            label_set=padchest_label_set,
+            inject_noise=getattr(args, 'inject_noise', False),
+            noise_type=getattr(args, 'noise_type', 'asym'),
+            sym_rate=getattr(args, 'sym_rate', 0.0),
+            fn_rate=getattr(args, 'fn_rate', 0.0),
+            fp_rate=getattr(args, 'fp_rate', 0.0),
+            random_seed=getattr(args, 'seed', 42),
+        )
         if args.evaluate:
             print("!!! [Evaluation Mode] Loading TEST dataset (PadChest-LT test.csv) !!!")
-            val_dataset = padchest(root=args.dataset_dir, mode='test', transform=test_data_transform)
+            val_dataset = padchest(
+                root=args.dataset_dir,
+                mode='test',
+                transform=test_data_transform,
+                label_set=padchest_label_set,
+            )
         else:
-            val_dataset = padchest(root=args.dataset_dir, mode='valid', transform=test_data_transform)
+            val_dataset = padchest(
+                root=args.dataset_dir,
+                mode='valid',
+                transform=test_data_transform,
+                label_set=padchest_label_set,
+            )
         args.num_class = train_dataset.get_number_classes()
     else:
         raise NotImplementedError("Unknown dataname %s" % args.dataname)

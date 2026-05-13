@@ -8,13 +8,13 @@ from utilities.multilabel_noise import inject_multilabel_noise
 
 class VinBigDataDataset(Dataset):
     task = 'multilabel'
-    num_labels = 15 
+    num_labels = 15
     
     label_names = [
         'Aortic enlargement', 'Atelectasis', 'Calcification', 'Cardiomegaly',
         'Consolidation', 'ILD', 'Infiltration', 'Lung Opacity', 'Nodule/Mass',
         'Other lesion', 'Pleural effusion', 'Pleural thickening', 'Pneumothorax',
-        'Pulmonary fibrosis', 'No finding'
+        'Pulmonary fibrosis','No finding'
     ]
 
     def __init__(self, root='/data/dsj/lys/vinbigdata', mode='train', transform=None, 
@@ -56,7 +56,8 @@ class VinBigDataDataset(Dataset):
                 noise_type=noise_type, 
                 sym_rate=sym_rate, 
                 fn_rate=fn_rate, 
-                fp_rate=fp_rate
+                fp_rate=fp_rate,
+                no_finding_idx=None
             )
             
             # 动态生成文件名以区分不同的噪声设置

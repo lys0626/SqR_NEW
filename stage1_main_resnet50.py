@@ -109,7 +109,7 @@ def build_dino(args):
         cam_temperature=args.cam_temperature,
     )
     # 使用 vits14 版本，对显存较友好
-    return DINOClassifier(num_class=args.num_class, arch='dinov2_vits14')
+    # return DINOClassifier(num_class=args.num_class, arch='dinov2_vits14')
 # ==========================================================
 
 def sec_to_str(seconds):
@@ -122,6 +122,8 @@ def parser_args():
     # == 原有基础参数 ==
     parser.add_argument('--dataname', default='nih', choices=['coco14', 'mimic', 'nih','chexpert', 'vinbigdata', 'padchest'])
     parser.add_argument('--dataset_dir', default='/comp_robot')
+    parser.add_argument('--padchest_label_set', default='lt189', choices=['lt189', 'xrv16'],
+                        help='PadChest label space: original LT labels or XRV18 NIH/MIMIC union projection.')
     parser.add_argument('--img_size', default=224, type=int) # 注意：必须是 14 的倍数
     parser.add_argument('--output', metavar='DIR', help='path to output folder')
     parser.add_argument('--num_class', default=14, type=int)
@@ -159,10 +161,14 @@ def parser_args():
     parser.add_argument('--mee_easy_loss_min_std', default=0.5, type=float)
     parser.add_argument('--mee_easy_loss_top_ratio', default=0.3, type=float)
     parser.add_argument('--mee_easy_min_conf', default=0.35, type=float)
+
     parser.add_argument('--mee_easy_grad_ratio', default=0.2, type=float)
     parser.add_argument('--hard_clean_ema_thresh', default=0.6, type=float)
     parser.add_argument('--hard_clean_var_thresh', default=0.2, type=float)
+    parser.add_argument('--enable_proto_evidence', action='store_true', default=False,
+                        help='Enable class-prototype GMM evidence. Disabled by default to avoid class-level collapse.')
     parser.add_argument('--proto_gmm_min_pos', default=100, type=int)
+
     parser.add_argument('--proto_gmm_prob_thresh', default=0.5, type=float)
     parser.add_argument('--knn_k', default=50, type=int)
     parser.add_argument('--knn_chunk_size', default=512, type=int)
@@ -172,12 +178,14 @@ def parser_args():
     parser.add_argument('--knn_mid_purity', default=0.05, type=float)
     parser.add_argument('--knn_head_purity', default=0.1, type=float)
     parser.add_argument('--fp_soft_max', default=0.5, type=float)
-    parser.add_argument('--fn_ema_thresh', default=0.7, type=float)
+    parser.add_argument('--fn_ema_thresh', default=0.85, type=float)
     parser.add_argument('--fn_var_thresh', default=0.2, type=float)
-    parser.add_argument('--fn_proto_sim_thresh', default=0.35, type=float)
-    parser.add_argument('--fn_knn_purity_thresh', default=0.05, type=float)
+    parser.add_argument('--fn_proto_sim_thresh', default=0.45, type=float)
+    #原本是0.25
+    parser.add_argument('--fn_knn_purity_thresh', default=0.55, type=float)
     parser.add_argument('--fn_prior_thresh', default=0.2, type=float)
-
+    parser.add_argument('--disable_fn_mining', action='store_true', default=False,
+                        help='关闭 Stage1 假阴性挖掘，仅保留假阳性修正')
     # ================= 标签级 MEE 核心对齐参数 =================
     parser.add_argument('--warm_up_epochs', default=6, type=int, help='前几个 Epoch 不记录 FkL')
     parser.add_argument('--fkl_consecutive_epochs', default=5, type=int, help='需要连续多少次预测正确才算候选干净标签')
@@ -197,7 +205,7 @@ def parser_args():
     parser.add_argument("--i_rate_3", type=int, default=0)
     parser.add_argument("--i_rate_4", type=int, default=0)
     
-    parser.add_argument("--remove_rate_1", type=float, default=0.95)
+    parser.add_argument("--remove_rate_1", type=float, default=0.94)
     parser.add_argument("--remove_rate_2", type=float, default=0.95)
     parser.add_argument("--remove_rate_3", type=float, default=0.995)
     parser.add_argument("--remove_rate_4", type=float, default=0.995)
@@ -903,7 +911,12 @@ def main():
                         if args.enable_label_reliability:
                             logger.info("    -> Running label-level Loss-GMM / MEE / Prototype / KNN reliability fusion...")
                             loss_gmm_losses = torch.where(dynamic_loss_seen, dynamic_loss_meter, ema_losses)
-                            active_positive_mask = all_targets.bool() & global_label_mask.bool()
+                            # FKL划分的干净标签用于loss区分
+                            # active_positive_mask = all_targets.bool() & global_label_mask.bool()
+
+                            #全部标签进行loss区分
+                            active_positive_mask = all_targets.bool()
+                            # 基于loss区分loss_clean_mask和loss_risk_mask两个子集，是对FKL确认的干净标签的划分
                             loss_clean_mask, loss_risk_mask = loss_gmm_split(
                                 loss_gmm_losses,
                                 active_positive_mask,
@@ -911,6 +924,7 @@ def main():
                                 prob_thresh=args.loss_gmm_prob_thresh,
                                 seed=args.seed,
                             )
+                            #选择标注错误简单样本的一个区域
                             easy_check_candidates = suspicious_high_loss_mask(
                                 ema_losses,
                                 loss_clean_mask,
@@ -921,6 +935,7 @@ def main():
                                 ema1.ema_model,
                                 ema2.ema_model
                             )
+                            #对标注错误简单样本的一个区域执行操作，寻找哪些是真正的标注错误的简单样本
                             mee_easy_noisy_mask = perform_mee_easy_noisy_check(
                                 ema_models_for_reliability,
                                 train_dataset_eval,
@@ -932,6 +947,7 @@ def main():
                             )
                             #最终干净标签的判断,下面这两个对于干净标签的判别法则不同
                             # seed_clean_mask = (loss_clean_mask & (~mee_easy_noisy_mask)) | (all_targets & global_label_mask)
+                            #loss筛选出的干净标签子集用于KNN的计算
                             seed_clean_mask = (
                                 active_positive_mask
                                 & loss_clean_mask.bool()
@@ -939,14 +955,20 @@ def main():
                             )
                             class_features = class_features_cpu.to(device=device, dtype=torch.float32)
                             #计算类原型区分下的干净标签和噪声标签
-                            proto_clean_mask, proto_noisy_mask, proto_sim = prototype_gmm_evidence(
-                                class_features,
-                                all_targets,
-                                seed_clean_mask,
-                                min_pos=args.proto_gmm_min_pos,
-                                prob_thresh=args.proto_gmm_prob_thresh,
-                                seed=args.seed,
-                            )
+                            if args.enable_proto_evidence:
+                                proto_clean_mask, proto_noisy_mask, proto_sim = prototype_gmm_evidence(
+                                    class_features,
+                                    all_targets,
+                                    seed_clean_mask,
+                                    min_pos=args.proto_gmm_min_pos,
+                                    prob_thresh=args.proto_gmm_prob_thresh,
+                                    seed=args.seed,
+                                )
+                            else:
+                                logger.info("    -> Class-prototype evidence disabled; prototype masks are all False.")
+                                proto_clean_mask = torch.zeros_like(all_targets, dtype=torch.bool)
+                                proto_noisy_mask = torch.zeros_like(all_targets, dtype=torch.bool)
+                                proto_sim = None
                             support_mask = seed_clean_mask | proto_clean_mask
                             knn_clean_mask, knn_noisy_mask, knn_purity = knn_purity_evidence(
                                 class_features,
@@ -960,6 +982,7 @@ def main():
                                 mid_purity=args.knn_mid_purity,
                                 head_purity=args.knn_head_purity,
                             )
+                            #找出在loss_risk_mask范围内的干净标签
                             dynamic_hard_clean_mask = build_dynamic_hard_clean_mask(
                                 loss_risk_mask,
                                 fkl_mask,
@@ -970,9 +993,13 @@ def main():
                                 ema_thresh=args.hard_clean_ema_thresh,
                                 var_thresh=args.hard_clean_var_thresh,
                             )
+                            # reliability：每个标签的可靠性分数，范围大约是 [0, 1]。
+                            # fp_mask：疑似 false positive，也就是原本标为 1、但现在怀疑是噪声的标签。
+                            # hard_clean_mask：确认保留的干净正标签，不应该被软化。
+                            # clear_noisy_fp：更明确的假阳性噪声标签，比 fp_mask 更强
                             label_reliability, fp_mask, hard_clean_mask, clear_noisy_fp = build_label_reliability(
-                                all_targets,
-                                global_label_mask,
+                                all_targets,#全局标签
+                                global_label_mask,#fkl筛选的干净标签
                                 loss_clean_mask,
                                 loss_risk_mask,
                                 mee_easy_noisy_mask,
@@ -983,20 +1010,25 @@ def main():
                                 knn_noisy_mask,
                                 fkl_mask,
                             )
-                            cond_prob_matrix = build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger)
-                            fn_mask = mine_false_negative_mask(
-                                all_targets,
-                                ema_preds,
-                                ema_vars,
-                                proto_sim,
-                                knn_purity,
-                                cond_prob_matrix,
-                                ema_thresh=args.fn_ema_thresh,
-                                var_thresh=args.fn_var_thresh,
-                                proto_sim_thresh=args.fn_proto_sim_thresh,
-                                knn_purity_thresh=args.fn_knn_purity_thresh,
-                                prior_thresh=args.fn_prior_thresh,
-                            )
+                            if args.disable_fn_mining:
+                                logger.info("    -> FN mining disabled by --disable_fn_mining; fn_mask is all False.")
+                                fn_mask = torch.zeros_like(all_targets, dtype=torch.bool)
+                            else:
+                                #用于假阴性的挖掘
+                                cond_prob_matrix = build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger)
+                                fn_mask = mine_false_negative_mask(
+                                    all_targets,
+                                    ema_preds,
+                                    ema_vars,
+                                    proto_sim,
+                                    knn_purity,
+                                    cond_prob_matrix,
+                                    ema_thresh=args.fn_ema_thresh,
+                                    var_thresh=args.fn_var_thresh,
+                                    proto_sim_thresh=args.fn_proto_sim_thresh,
+                                    knn_purity_thresh=args.fn_knn_purity_thresh,
+                                    prior_thresh=args.fn_prior_thresh,
+                                )
                             final_soft_targets = generate_asymmetric_soft_targets(
                                 all_targets,
                                 ema_preds,
@@ -1031,18 +1063,22 @@ def main():
                             fp_mask = (all_targets == 1) & (~global_label_mask)
                             clear_noisy_fp = fp_mask
                             hard_clean_mask = all_targets & (~fp_mask)
-                            cond_prob_matrix = build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger)
-                            fn_mask = mine_false_negative_mask(
-                                all_targets,
-                                ema_preds,
-                                ema_vars,
-                                None,
-                                None,
-                                cond_prob_matrix,
-                                ema_thresh=args.fn_ema_thresh,
-                                var_thresh=args.fn_var_thresh,
-                                prior_thresh=args.fn_prior_thresh,
-                            )
+                            if args.disable_fn_mining:
+                                logger.info("    -> FN mining disabled by --disable_fn_mining; fn_mask is all False.")
+                                fn_mask = torch.zeros_like(all_targets, dtype=torch.bool)
+                            else:
+                                cond_prob_matrix = build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger)
+                                fn_mask = mine_false_negative_mask(
+                                    all_targets,
+                                    ema_preds,
+                                    ema_vars,
+                                    None,
+                                    None,
+                                    cond_prob_matrix,
+                                    ema_thresh=args.fn_ema_thresh,
+                                    var_thresh=args.fn_var_thresh,
+                                    prior_thresh=args.fn_prior_thresh,
+                                )
                             final_soft_targets = generate_asymmetric_soft_targets(
                                 all_targets,
                                 ema_preds,
