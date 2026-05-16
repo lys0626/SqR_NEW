@@ -1,14 +1,14 @@
 set -e  # <--- [强烈建议新增] 只要发生任何报错，脚本立刻停止，绝不往下瞎跑！
 
 # ================= 1. 基础全局配置 =================
-GPU_ID=5
+GPU_ID=2
 
 DATASET_NAME="vinbigdata"                     # 对应 stage1 里的 args.dataname
 DATASET_NAME_UPPER="VINBIGDATA"               
 DATA_DIR="/data/dsj/lys/vinbigdata"
 NUM_CLASS=15
 
-EXP_DIR="./experiment/VINVIG_denoise/END/5_13_0.94_0.95_4_asym_0.2_0.2_0.85_0.2_all_loss_clean_0.55KNN"        # 实验输出的顶层根目录
+EXP_DIR="./experiment/VINVIG_denoise/NEW_FN/5_16_0.94_0.95_4/5_16_best_asym_60%"        # 实验输出的顶层根目录
 STAGE2_METHOD="splicemix-cl"         
 
 # ================= 3. 动态生成输出目录 =================
@@ -43,6 +43,6 @@ python stage1_main_resnet50.py \
   --warm_up_epochs 0 \
   --inject_noise \
   --noise_type asym \
-  --fn_rate 0.2 \
-  --fp_rate 0.2 \
+  --fn_rate 0.6 \
+  --fp_rate 0.6 \
 

@@ -25,13 +25,10 @@ from lib.models.aslloss import AsymmetricLossOptimized
 from stage1_label_reliability import (
     build_dynamic_hard_clean_mask,
     build_label_reliability,
-    empty_fp_aligned_fn_diagnostics,
     generate_asymmetric_soft_targets,
     knn_purity_evidence,
-    knn_purity_evidence_for_candidates,
     loss_gmm_split,
     mine_false_negative_mask,
-    mine_false_negative_mask_fp_aligned,
     prototype_gmm_evidence,
     save_reliability_outputs,
     save_reliability_summary,
@@ -179,16 +176,13 @@ def parser_args():
     parser.add_argument('--knn_head_purity', default=0.1, type=float)
     parser.add_argument('--fp_soft_max', default=0.5, type=float)
     parser.add_argument('--fn_ema_thresh', default=0.85, type=float)
-    parser.add_argument('--fn_var_thresh', default=0.1, type=float)
+    parser.add_argument('--fn_var_thresh', default=0.2, type=float)
     parser.add_argument('--fn_proto_sim_thresh', default=0.45, type=float)
     #原本是0.25
-    parser.add_argument('--fn_knn_purity_thresh', default=0.35, type=float)
+    parser.add_argument('--fn_knn_purity_thresh', default=0.55, type=float)
     parser.add_argument('--fn_prior_thresh', default=0.2, type=float)
     parser.add_argument('--disable_fn_mining', action='store_true', default=False,
                         help='关闭 Stage1 假阴性挖掘，仅保留假阳性修正')
-    parser.add_argument('--fn_mining_mode', default='fp_aligned', choices=['fp_aligned', 'legacy'],
-                        help='FN mining mode: fp_aligned mirrors FP reliability evidence; legacy uses EMA/prior mining.')
-
     # ================= 标签级 MEE 核心对齐参数 =================
     parser.add_argument('--warm_up_epochs', default=6, type=int, help='前几个 Epoch 不记录 FkL')
     parser.add_argument('--fkl_consecutive_epochs', default=5, type=int, help='需要连续多少次预测正确才算候选干净标签')
@@ -924,8 +918,7 @@ def main():
                                 loss_gmm_losses,
                                 active_positive_mask,
                                 min_pos=args.loss_gmm_min_pos,
-                                # prob_thresh=args.loss_gmm_prob_thresh,
-                                prob_thresh=0.6, #4
+                                prob_thresh=args.loss_gmm_prob_thresh,
                                 seed=args.seed,
                             )
                             #选择标注错误简单样本的一个区域
@@ -966,7 +959,7 @@ def main():
                             proto_sim = None
                             
                             support_mask = seed_clean_mask | proto_clean_mask
-                            knn_clean_mask, knn_noisy_mask, knn_purity = knn_purity_evidence_for_candidates(
+                            knn_clean_mask, knn_noisy_mask, knn_purity = knn_purity_evidence(
                                 class_features,
                                 all_targets,
                                 support_mask,
@@ -986,10 +979,8 @@ def main():
                                 ema_vars,
                                 proto_clean_mask,
                                 knn_clean_mask,
-                                # ema_thresh=args.hard_clean_ema_thresh,
-                                # var_thresh=args.hard_clean_var_thresh,
-                                ema_thresh=0.85,#5
-                                var_thresh=0.1,#6
+                                ema_thresh=args.hard_clean_ema_thresh,
+                                var_thresh=args.hard_clean_var_thresh,
                             )
                             # reliability：每个标签的可靠性分数，范围大约是 [0, 1]。
                             # fp_mask：疑似 false positive，也就是原本标为 1、但现在怀疑是噪声的标签。
@@ -1011,11 +1002,9 @@ def main():
                             if args.disable_fn_mining:
                                 logger.info("    -> FN mining disabled by --disable_fn_mining; fn_mask is all False.")
                                 fn_mask = torch.zeros_like(all_targets, dtype=torch.bool)
-                                fn_diagnostics = empty_fp_aligned_fn_diagnostics(all_targets)
-                            elif args.fn_mining_mode == 'legacy':
-                                logger.info("    -> Running legacy EMA/prior FN mining.")
+                            else:
+                                #用于假阴性的挖掘
                                 cond_prob_matrix = build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger)
-                                # 对于假阴性的挖掘
                                 fn_mask = mine_false_negative_mask(
                                     all_targets,
                                     ema_preds,
@@ -1028,30 +1017,6 @@ def main():
                                     proto_sim_thresh=args.fn_proto_sim_thresh,
                                     knn_purity_thresh=args.fn_knn_purity_thresh,
                                     prior_thresh=args.fn_prior_thresh,
-                                )
-                                fn_diagnostics = empty_fp_aligned_fn_diagnostics(all_targets)
-                            else:
-                                logger.info("    -> Running FP-aligned FN mining over zero-label candidates.")
-                                fn_mask, fn_diagnostics = mine_false_negative_mask_fp_aligned(
-                                    all_targets,
-                                    loss_gmm_losses,
-                                    ema_preds,
-                                    ema_vars,
-                                    class_features,
-                                    min_count=args.loss_gmm_min_pos,
-                                    loss_prob_thresh=args.loss_gmm_prob_thresh,
-                                    seed=args.seed,
-                                    # hard_clean_ema_thresh=args.hard_clean_ema_thresh,
-                                    # hard_clean_var_thresh=args.hard_clean_var_thresh,
-                                    hard_clean_ema_thresh=0.05,#1
-                                    hard_clean_var_thresh=0.5,#2
-                                    knn_k=args.knn_k,
-                                    knn_chunk_size=args.knn_chunk_size,
-                                    knn_tail_cutoff=args.knn_tail_cutoff,
-                                    knn_mid_cutoff=args.knn_mid_cutoff,
-                                    knn_tail_purity=args.knn_tail_purity,
-                                    knn_mid_purity=args.knn_mid_purity,
-                                    knn_head_purity=args.knn_head_purity,
                                 )
                             final_soft_targets = generate_asymmetric_soft_targets(
                                 all_targets,
@@ -1078,7 +1043,6 @@ def main():
                                 'knn_clean_mask': knn_clean_mask,
                                 'knn_noisy_mask': knn_noisy_mask,
                             }
-                            diagnostic_tensors.update(fn_diagnostics)
                             save_reliability_outputs(args.output, diagnostic_tensors)
                             save_reliability_summary(args.output, all_targets, diagnostic_tensors)
                             del class_features
@@ -1091,8 +1055,7 @@ def main():
                             if args.disable_fn_mining:
                                 logger.info("    -> FN mining disabled by --disable_fn_mining; fn_mask is all False.")
                                 fn_mask = torch.zeros_like(all_targets, dtype=torch.bool)
-                            elif args.fn_mining_mode == 'legacy':
-                                logger.info("    -> Running legacy EMA/prior FN mining.")
+                            else:
                                 cond_prob_matrix = build_hybrid_cond_prob_matrix(all_targets, global_label_mask, args, device, logger)
                                 fn_mask = mine_false_negative_mask(
                                     all_targets,
@@ -1105,30 +1068,6 @@ def main():
                                     var_thresh=args.fn_var_thresh,
                                     prior_thresh=args.fn_prior_thresh,
                                 )
-                            else:
-                                logger.info("    -> Running FP-aligned FN mining over zero-label candidates.")
-                                class_features = class_features_cpu.to(device=device, dtype=torch.float32)
-                                loss_gmm_losses = torch.where(dynamic_loss_seen, dynamic_loss_meter, ema_losses)
-                                fn_mask, _ = mine_false_negative_mask_fp_aligned(
-                                    all_targets,
-                                    loss_gmm_losses,
-                                    ema_preds,
-                                    ema_vars,
-                                    class_features,
-                                    min_count=args.loss_gmm_min_pos,
-                                    loss_prob_thresh=args.loss_gmm_prob_thresh,
-                                    seed=args.seed,
-                                    hard_clean_ema_thresh=args.hard_clean_ema_thresh,
-                                    hard_clean_var_thresh=args.hard_clean_var_thresh,
-                                    knn_k=args.knn_k,
-                                    knn_chunk_size=args.knn_chunk_size,
-                                    knn_tail_cutoff=args.knn_tail_cutoff,
-                                    knn_mid_cutoff=args.knn_mid_cutoff,
-                                    knn_tail_purity=args.knn_tail_purity,
-                                    knn_mid_purity=args.knn_mid_purity,
-                                    knn_head_purity=args.knn_head_purity,
-                                )
-                                del class_features
                             final_soft_targets = generate_asymmetric_soft_targets(
                                 all_targets,
                                 ema_preds,

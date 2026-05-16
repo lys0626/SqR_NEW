@@ -133,6 +133,56 @@ def print_four_way_summary(clean, noisy, soft_pred, fp_mask, fn_mask):
     print()
 
 
+def print_no_finding_summary(clean, noisy, soft_pred, fp_mask, fn_mask, no_finding_idx):
+    if no_finding_idx < 0 or no_finding_idx >= clean.size(1):
+        raise ValueError(
+            f"no_finding_idx={no_finding_idx} is out of range for "
+            f"{clean.size(1)} classes."
+        )
+
+    clean_nf = clean[:, no_finding_idx].bool()
+    noisy_nf = noisy[:, no_finding_idx].bool()
+    soft_pred_nf = soft_pred[:, no_finding_idx].bool()
+    fp_mask_nf = fp_mask[:, no_finding_idx].bool()
+    fn_mask_nf = fn_mask[:, no_finding_idx].bool()
+
+    nf_changed = clean_nf != noisy_nf
+    nf_fp_noise = noisy_nf & (~clean_nf)
+    nf_fn_noise = (~noisy_nf) & clean_nf
+
+    nf_fp_mask_tp = fp_mask_nf & nf_fp_noise
+    nf_fn_mask_tp = fn_mask_nf & nf_fn_noise
+    nf_mask_tp = nf_fp_mask_tp | nf_fn_mask_tp
+
+    nf_fp_corrected = nf_fp_noise & (~soft_pred_nf)
+    nf_fn_corrected = nf_fn_noise & soft_pred_nf
+    nf_final_recovered = nf_changed & (soft_pred_nf == clean_nf)
+    nf_final_not_recovered = nf_changed & (soft_pred_nf != clean_nf)
+
+    nf_fp_wrong_selected_clean = fp_mask_nf & noisy_nf & clean_nf
+    nf_fn_wrong_selected_clean = fn_mask_nf & (~noisy_nf) & (~clean_nf)
+
+    print("No finding 类专项分析")
+    print(f"  No finding 类索引: {no_finding_idx}")
+    print(f"  干净标签中 No finding 阳性数: {count(clean_nf)}")
+    print(f"  噪声标签中 No finding 阳性数: {count(noisy_nf)}")
+    print(f"  No finding 被噪声改变总数: {count(nf_changed)}")
+    print(f"    被错误加入 0->1 的数量: {count(nf_fp_noise)}")
+    print(f"    被错误删除 1->0 的数量: {count(nf_fn_noise)}")
+    print("  Stage1 mask 对 No finding 改变的找回情况")
+    print(f"    fp_mask 命中 0->1 错误: {count(nf_fp_mask_tp)} / {count(nf_fp_noise)} ({pct(count(nf_fp_mask_tp), count(nf_fp_noise))})")
+    print(f"    fn_mask 命中 1->0 错误: {count(nf_fn_mask_tp)} / {count(nf_fn_noise)} ({pct(count(nf_fn_mask_tp), count(nf_fn_noise))})")
+    print(f"    mask 合计命中被改变标签: {count(nf_mask_tp)} / {count(nf_changed)} ({pct(count(nf_mask_tp), count(nf_changed))})")
+    print(f"    fp_mask 误选 No finding 干净阳性: {count(nf_fp_wrong_selected_clean)}")
+    print(f"    fn_mask 误选 No finding 干净阴性: {count(nf_fn_wrong_selected_clean)}")
+    print("  soft label 二值化后 No finding 的最终找回情况")
+    print(f"    0->1 错误最终被纠正回 0: {count(nf_fp_corrected)} / {count(nf_fp_noise)} ({pct(count(nf_fp_corrected), count(nf_fp_noise))})")
+    print(f"    1->0 错误最终被纠正回 1: {count(nf_fn_corrected)} / {count(nf_fn_noise)} ({pct(count(nf_fn_corrected), count(nf_fn_noise))})")
+    print(f"    所有被改变的 No finding 中最终恢复到干净标签: {count(nf_final_recovered)} / {count(nf_changed)} ({pct(count(nf_final_recovered), count(nf_changed))})")
+    print(f"    所有被改变的 No finding 中最终仍未恢复: {count(nf_final_not_recovered)} / {count(nf_changed)} ({pct(count(nf_final_not_recovered), count(nf_changed))})")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze Stage1 fp_mask.pt and fn_mask.pt against clean/noisy labels."
@@ -147,15 +197,16 @@ def main():
         default="/data/dsj/lys/vinbigdata/noisy_labels_ASYM_FN0.2_FP0.2_Total0.200.pt",
         help="Path to injected-noise labels used by Stage1.",
     )
-    parser.add_argument("--soft-targets", default='/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/END/5_13_0.94_0.95_4_asym_0.2_0.2_0.8_0.1_all_loss_clean_0.35KNN/vinbigdata/stage1_splicemix-cl/asymmetric_soft_targets.pt')
-    parser.add_argument("--fp-mask", default='/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/END/5_13_0.94_0.95_4_asym_0.2_0.2_0.8_0.1_all_loss_clean_0.35KNN/vinbigdata/stage1_splicemix-cl/fp_mask.pt')
-    parser.add_argument("--fn-mask", default='/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/END/5_13_0.94_0.95_4_asym_0.2_0.2_0.8_0.1_all_loss_clean_0.35KNN/vinbigdata/stage1_splicemix-cl/fn_mask.pt')
+    parser.add_argument("--soft-targets", default="/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/NEW_FN/best/5_15_asym_0.05_0.5_0.05_0.6_0.85_0.1/best/stage1_splicemix-cl/asymmetric_soft_targets.pt")
+    parser.add_argument("--fp-mask", default="/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/NEW_FN/best/5_15_asym_0.05_0.5_0.05_0.6_0.85_0.1/best/stage1_splicemix-cl/fp_mask.pt")
+    parser.add_argument("--fn-mask", default="/data/dsj/lys/SqR-NEW/experiment/VINVIG_denoise/NEW_FN/best/5_15_asym_0.05_0.5_0.05_0.6_0.85_0.1/best/stage1_splicemix-cl/fn_mask.pt")
     parser.add_argument("--threshold", default=0.7, type=float)
+    parser.add_argument("--no-finding-idx", default=14, type=int)
     args = parser.parse_args()
 
-    soft_path = args.soft_targets 
-    fp_path = args.fp_mask 
-    fn_path = args.fn_mask 
+    soft_path = args.soft_targets
+    fp_path = args.fp_mask
+    fn_path = args.fn_mask
     clean = load_tensor(args.clean_labels).bool()
     noisy = load_tensor(args.noisy_labels).bool()
     soft = load_tensor(soft_path).float()
@@ -187,6 +238,8 @@ def main():
     print(f"注入噪声总数: {count(noisy != clean)}")
     print()
 
+    print_no_finding_summary(clean, noisy, soft_pred, fp_mask, fn_mask, args.no_finding_idx)
+
     metric_line("fp_mask 对假阳性标签的选择质量", fp_mask, true_fp_noise, clean_pos)
     metric_line("fn_mask 对假阴性标签的选择质量", fn_mask, true_fn_noise, clean_neg)
     print_four_way_summary(clean, noisy, soft_pred, fp_mask, fn_mask)
@@ -207,8 +260,6 @@ def main():
     print(f"  原本干净阴性标签被错误改成阳性的数量: {count(degraded_clean_neg)}")
     print(f"    其中落在 fn_mask 中的数量: {count(degraded_clean_neg & fn_mask)}")
     print()
-
-
 
 
 if __name__ == "__main__":

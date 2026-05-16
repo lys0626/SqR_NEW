@@ -27,7 +27,6 @@ def _fit_clean_component(values, min_count, seed, prob_thresh):
             random_state=seed,
         )
         gmm.fit(values)
-        # 低 loss 通常代表标签和模型预测一致，所以认为是 clean component。
         clean_comp = gmm.means_.argmin()
         clean_prob = gmm.predict_proba(values)[:, clean_comp]
         return clean_prob > prob_thresh
@@ -35,41 +34,32 @@ def _fit_clean_component(values, min_count, seed, prob_thresh):
         return np.ones(len(values), dtype=bool)
 
 
-def loss_gmm_split_for_candidates(losses, candidate_mask, min_count=100, prob_thresh=0.5, seed=95):
-    """Per-class log-loss GMM split for any label candidate pool."""
-    candidate_mask = candidate_mask.bool()
-    loss_clean = _empty_bool_like(candidate_mask)
-    loss_risk = _empty_bool_like(candidate_mask)
+def loss_gmm_split(losses, targets, min_pos=100, prob_thresh=0.5, seed=95):
+    """Per-class log-loss GMM split for positive labels."""
+    targets = targets.bool()
+    loss_clean = _empty_bool_like(targets)
+    loss_risk = _empty_bool_like(targets)
 
-    for c in range(candidate_mask.size(1)):
-        idx = torch.where(candidate_mask[:, c])[0]
-        if len(idx) == 0:
+    for c in range(targets.size(1)):
+        pos = torch.where(targets[:, c])[0]
+        if len(pos) == 0:
             continue
 
-        class_losses = losses[idx, c].detach().float().cpu().numpy()
+        class_losses = losses[pos, c].detach().float().cpu().numpy()
         log_losses = np.log(class_losses + 1e-8)
-        #削弱极端loss值对GMM拟合的影响
-        if len(log_losses) >= min_count:
+        if len(log_losses) >= min_pos:
             p1, p99 = np.percentile(log_losses, 1), np.percentile(log_losses, 99)
             log_losses = np.clip(log_losses, p1, p99)
 
-        is_clean = _fit_clean_component(log_losses, min_count, seed, prob_thresh)
+        is_clean = _fit_clean_component(log_losses, min_pos, seed, prob_thresh)
         is_clean = torch.from_numpy(is_clean).bool()
-        clean_idx = idx[is_clean.to(idx.device)]
-        risk_idx = idx[(~is_clean).to(idx.device)]
+        clean_idx = pos[is_clean.to(pos.device)]
+        risk_idx = pos[(~is_clean).to(pos.device)]
         loss_clean[clean_idx, c] = True
         loss_risk[risk_idx, c] = True
 
     return loss_clean, loss_risk
-def loss_gmm_split(losses, targets, min_pos=100, prob_thresh=0.5, seed=95):
-    """Per-class log-loss GMM split for positive-label candidates."""
-    return loss_gmm_split_for_candidates(
-        losses,
-        targets,
-        min_count=min_pos,
-        prob_thresh=prob_thresh,
-        seed=seed,
-    )
+
 
 # def top_loss_mask(losses, candidate_mask, top_ratio=0.3):
 #     selected = _empty_bool_like(candidate_mask)
@@ -145,9 +135,9 @@ def _knn_threshold(pos_count, tail_cutoff, mid_cutoff, tail_purity, mid_purity, 
     return head_purity
 
 
-def knn_purity_evidence_for_candidates(
+def knn_purity_evidence(
     class_features,
-    candidate_mask,
+    targets,
     support_mask,
     k=50,
     chunk_size=512,
@@ -159,7 +149,7 @@ def knn_purity_evidence_for_candidates(
 ):
     """Compute local label-support purity in each class-specific feature space."""
     device = class_features.device
-    candidate_mask = candidate_mask.bool().to(device)
+    targets = targets.bool().to(device)
     support_mask = support_mask.bool().to(device)
     num_samples, num_classes, _ = class_features.shape
 
@@ -168,17 +158,17 @@ def knn_purity_evidence_for_candidates(
     purity_scores = torch.zeros((num_samples, num_classes), dtype=torch.float32, device=device)
 
     if k <= 0:
-        knn_clean[candidate_mask] = True
+        knn_clean[targets] = True
         return knn_clean, knn_noisy, purity_scores
 
     for c in range(num_classes):
-        cand = torch.where(candidate_mask[:, c])[0]
-        cand_count = len(cand)
-        if cand_count == 0:
+        pos = torch.where(targets[:, c])[0]
+        pos_count = len(pos)
+        if pos_count == 0:
             continue
 
         threshold = _knn_threshold(
-            cand_count,
+            pos_count,
             tail_cutoff,
             mid_cutoff,
             tail_purity,
@@ -187,8 +177,8 @@ def knn_purity_evidence_for_candidates(
         )
         feats_c = F.normalize(class_features[:, c, :].float(), p=2, dim=1)
         support = support_mask[:, c]
-        if int(support.sum().item()) < max(1, min(k, cand_count) // 2):
-            support = candidate_mask[:, c]
+        if int(support.sum().item()) < max(1, min(k, pos_count) // 2):
+            support = targets[:, c]
 
         for start in range(0, num_samples, chunk_size):
             end = min(start + chunk_size, num_samples)
@@ -203,36 +193,10 @@ def knn_purity_evidence_for_candidates(
                 purity = support[neigh].float().mean(dim=1)
             purity_scores[query, c] = purity
 
-        cand_purity = purity_scores[cand, c]
-        is_clean = cand_purity >= threshold
-        knn_clean[cand[is_clean], c] = True
-        knn_noisy[cand[~is_clean], c] = True
-    return knn_clean, knn_noisy, purity_scores
-def knn_purity_evidence(
-    class_features,
-    targets,
-    support_mask,
-    k=50,
-    chunk_size=512,
-    tail_cutoff=100,
-    mid_cutoff=200,
-    tail_purity=0.0,
-    mid_purity=0.05,
-    head_purity=0.1,
-):
-    """Compute local label-support purity for positive-label candidates."""
-    return knn_purity_evidence_for_candidates(
-        class_features,
-        targets,
-        support_mask,
-        k=k,
-        chunk_size=chunk_size,
-        tail_cutoff=tail_cutoff,
-        mid_cutoff=mid_cutoff,
-        tail_purity=tail_purity,
-        mid_purity=mid_purity,
-        head_purity=head_purity,
-    )
+        pos_purity = purity_scores[pos, c]
+        is_clean = pos_purity >= threshold
+        knn_clean[pos[is_clean], c] = True
+        knn_noisy[pos[~is_clean], c] = True
 
     return knn_clean, knn_noisy, purity_scores
 
@@ -409,77 +373,3 @@ def save_reliability_summary(output_dir, targets, tensors):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-def empty_fp_aligned_fn_diagnostics(targets):
-    empty = torch.zeros_like(targets, dtype=torch.bool)
-    return {
-        'fn_loss_clean_mask': empty.clone(),
-        'fn_loss_risk_mask': empty.clone(),
-        'fn_dynamic_hard_clean_mask': empty.clone(),
-        'fn_knn_clean_mask': empty.clone(),
-    }
-
-
-def mine_false_negative_mask_fp_aligned(
-    targets,
-    losses,
-    ema_preds,
-    ema_vars,
-    class_features,
-    min_count=100,
-    loss_prob_thresh=0.5,
-    seed=95,
-    hard_clean_ema_thresh=0.6,
-    hard_clean_var_thresh=0.2,
-    knn_k=50,
-    knn_chunk_size=512,
-    knn_tail_cutoff=100,
-    knn_mid_cutoff=200,
-    knn_tail_purity=0.0,
-    knn_mid_purity=0.05,
-    knn_head_purity=0.1,
-):
-    targets = targets.bool()
-    candidate_zero = ~targets
-
-    fn_loss_clean_mask, fn_loss_risk_mask = loss_gmm_split_for_candidates(
-        losses,
-        candidate_zero,
-        min_count=min_count,
-        prob_thresh=0.05,#值越低，对于FN的挖掘就越严格 3
-        seed=seed,
-    )
-
-    if class_features is None:
-        fn_knn_clean_mask = torch.zeros_like(targets, dtype=torch.bool)
-    else:
-        fn_knn_clean_mask, _, _ = knn_purity_evidence_for_candidates(
-            class_features,
-            candidate_zero,
-            fn_loss_clean_mask,
-            k=knn_k,
-            chunk_size=knn_chunk_size,
-            tail_cutoff=knn_tail_cutoff,
-            mid_cutoff=knn_mid_cutoff,
-            tail_purity=knn_tail_purity,
-            mid_purity=knn_mid_purity,
-            head_purity=knn_head_purity,
-        )
-
-    #hard_clean_ema_thresh较小和hard_clean_var_thresh较大对于假阴性的挖掘越严格
-    dynamic_support = (
-        candidate_zero
-        & (ema_preds <= (1.0 - hard_clean_ema_thresh))
-        & (ema_vars <= hard_clean_var_thresh)
-    )
-    fn_dynamic_hard_clean_mask = fn_loss_risk_mask & dynamic_support & fn_knn_clean_mask
-    fn_mask = candidate_zero & (~(fn_loss_clean_mask | fn_dynamic_hard_clean_mask))
-
-    diagnostics = {
-        'fn_loss_clean_mask': fn_loss_clean_mask,
-        'fn_loss_risk_mask': fn_loss_risk_mask,
-        'fn_dynamic_hard_clean_mask': fn_dynamic_hard_clean_mask,
-        'fn_knn_clean_mask': fn_knn_clean_mask,
-    }
-    return fn_mask, diagnostics
-
-
